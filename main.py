@@ -1,9 +1,9 @@
 """End-to-end batch runner.
 
 pose_2d, sync, music_analyzer, calibrate_3d, filters, epoch_segmenter,
-salsa_rhythm, visualize.
+salsa_rhythm, visualize, then overlay_video (skip with --no-overlay).
 
-    python main.py --config sessions.json [--session subject_01] [--force-pose]
+    python main.py --config sessions.json [--session subject_01] [--force-pose] [--no-overlay]
 """
 
 from __future__ import annotations
@@ -202,7 +202,8 @@ def analyze_subject(
     }
 
 
-def run_session(sess: dict[str, Any], cfg: dict[str, Any], force_pose: bool = False) -> dict[str, Any]:
+def run_session(sess: dict[str, Any], cfg: dict[str, Any], force_pose: bool = False,
+                render_overlay: bool = True) -> dict[str, Any]:
     sid = sess["id"]
     cache = Path(cfg["cache_dir"]) / sid
     out_dir = Path(cfg["output_root"]) / sid
@@ -215,8 +216,23 @@ def run_session(sess: dict[str, Any], cfg: dict[str, Any], force_pose: bool = Fa
                                        params["music"])
     log.info("[%s] music: %.1f BPM, mp3 offset %.3fs via %s (conf %.2f)", sid, music.bpm, music.mp3_offset_sec,
              music.method, music.confidence)
-    return analyze_subject(sid, pose1, pose2, music, sess["height_meters"], params, out_dir, sess["cam1"],
-                           sess["cam2"], sess["overrides"]["frame_offset"])
+    row = analyze_subject(sid, pose1, pose2, music, sess["height_meters"], params, out_dir, sess["cam1"],
+                          sess["cam2"], sess["overrides"]["frame_offset"])
+    row["overlay"] = None
+    if render_overlay:
+        if not Path(sess["cam1"]).is_file():
+            log.info("[%s] overlay skipped: %s not found", sid, sess["cam1"])
+        else:
+            import overlay_video
+
+            log.info("[%s] rendering overlay video", sid)
+            try:
+                info = overlay_video.render_for_session(sess, cfg)
+                row["overlay"] = info["path"]
+                row["warnings"] = row["warnings"] + info["warnings"]
+            except Exception as exc:  # the analysis results are still valid
+                row["warnings"] = row["warnings"] + [f"overlay rendering failed: {exc}"]
+    return row
 
 
 def format_summary(rows: list[dict[str, Any]]) -> str:
@@ -244,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", default="sessions.json")
     ap.add_argument("--session", action="append", help="only process this session id (repeatable)")
     ap.add_argument("--force-pose", action="store_true", help="ignore cached 2D pose .npz files")
+    ap.add_argument("--no-overlay", action="store_true", help="skip rendering overlay_cam1.mp4")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -260,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     rows = []
     for sess in sessions:
         try:
-            rows.append(run_session(sess, cfg, args.force_pose))
+            rows.append(run_session(sess, cfg, args.force_pose, not args.no_overlay))
         except Exception as exc:  # keep going with the other subjects
             log.error("[%s] FAILED: %s", sess["id"], exc)
             log.debug(traceback.format_exc())

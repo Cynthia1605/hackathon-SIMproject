@@ -74,6 +74,7 @@ Any warnings follow the table: an audio/visual sync disagreement, low music-alig
 | `epochs_and_steps.json` | Everything: sync, music alignment (BPM, offset, beat grid), calibration (K, R, t, scale, reprojection error), segmentation thresholds, epochs with per-epoch summaries, every step, overall summary, warnings, the merged parameters used |
 | `steps.csv` | One row per footfall: `subject_id, epoch_id, cam1_frame, timestamp_sec, nearest_music_beat_sec, beat_offset_ms, foot, timing_type, beat_count, step_length_cm` |
 | `rhythm_analysis.png` | Diagnostic plot (below) |
+| `overlay_cam1.mp4` | cam1 with skeleton + live rhythm HUD (see section 6) |
 | `points3d.npz` | Filtered metric 3D landmarks `(N, 33, 3)` plus the `cam1_frames` they belong to |
 
 **Reading the results**
@@ -92,14 +93,49 @@ Any warnings follow the table: an audio/visual sync disagreement, low music-alig
 2. **Zoom** on the first 6 s of dancing. Shows left/right foot horizontal speed (solid) and lift (dashed), the music beat grid (grey), and labelled footfalls (`L1, R2, L3-SLOW, R5, L6, R7-SLOW`).
 3. **Timing offset** for every step, with a rolling mean per epoch. Drift towards early or late shows up immediately.
 
-## 6. Troubleshooting
+## 6. Video overlay and tempo dashboard
+
+**Skeleton + rhythm HUD video.** `main.py` renders `outputs/<id>/overlay_cam1.mp4` automatically after the analysis (skip it with `--no-overlay`). To re-render it on its own:
+```bash
+python overlay_video.py --config sessions.json --subject subject_01
+```
+For a quick preview of the first 20 s:
+```bash
+python overlay_video.py --config sessions.json --subject subject_01 --max-seconds 20
+```
+- **Skeleton:** the full MediaPipe skeleton, with the lower body in thick neon (cyan = left, magenta = right, yellow = hips).
+- **HUD, top-left:**
+  - `BAILANDO / ACTIVO` vs `EN PAUSA / IDLE`;
+  - the live 8-count `1 - 2 - 3 - (4) - 5 - 6 - 7 - (8)`;
+  - feedback on the last step: `A TIEMPO` (green, ≤ ±45 ms), `LEVEMENTE ADELANTADO/ATRASADO` (yellow, ≤ ±90 ms) or `FUERA DE TEMPO` (red, > 90 ms).
+- **Footfall ring:** a ring flashes around the stepping foot at each footfall.
+- **Encoding:** with ffmpeg available (on PATH, or the one bundled with `imageio-ffmpeg`), the video is re-encoded to browser-friendly H.264 with the original camera audio. Without ffmpeg it falls back to OpenCV `avc1`/`mp4v` with no audio.
+
+**Interactive dashboard (Spanish UI).** It needs `epochs_and_steps.json` and, ideally, `overlay_cam1.mp4`:
+```bash
+python dashboard.py --config sessions.json --subject subject_01
+```
+It opens `http://127.0.0.1:8765/` in your browser; Ctrl+C stops it. Use `--port` to change the port and `--no-browser` to not open a tab. It only needs the standard library and works offline.
+- **Video and music:** the overlay video plays alongside the clean `.mp3`, positioned with `mp3_offset_sec`.
+  - The *Ajuste de audio* slider (±500 ms) fine-tunes the music offset live. The step offsets in the chart and table update with it.
+  - Speed: `0.5×` *cámara lenta*, `0.75×`, `1.0×` *normal*.
+  - Optional Web Audio metronome on beats 1, 2, 3, 5, 6, 7 (accented on the 1).
+- **Veredicto general de tempo:** a 0–100% score, plus a verdict, KPI cards and coaching notes in Spanish.
+  - Score: 80% timing credit and 20% quick-quick-slow accuracy. Timing credit is full within ±45 ms, half at ±90 ms, and zero at half a beat.
+  - Verdict, for example *¡Excelente ritmo! En tempo* or *Tendencia a adelantarse*.
+  - KPI cards: BPM, % of steps on time, mean offset, consistency, 1-2-3/5-6-7 accuracy.
+  - Coaching notes cover beats 1 and 5, whether slow steps 3 and 7 rush, left/right symmetry, and drift between blocks.
+- **Línea de tiempo y tabla de pasos:** every step's `beat_offset_ms` is plotted with the green ±45 ms zone. Clicking a point or a table row jumps the video to that step.
+- **Off-beat warning:** if every step sits about half a beat from the pulse, the dashboard warns that the song's beat grid may be on the off-beat (*contratiempo*). Use the metronome to check, then fix `overrides.mp3_offset_sec`.
+
+## 7. Troubleshooting
 - **Sync `method` is `motion_xcorr`, or the offset looks wrong.** No clap was found in both cameras. Check `clap_frames_cam1/cam2` in `sync.json`, then set `overrides.frame_offset`. One way to find it: note the video frame of the clap in each camera, and use `cam2_frame - cam1_frame`.
 - **Music `confidence` < 0.2, or every step is off by the same amount.** The music alignment is likely one beat out. Set `overrides.mp3_offset_sec`.
 - **Too few or too many epochs.** Tune `segmenter.min_start_energy` / `min_stop_energy`, and see the energy curve in panel 1.
 - **Beats 1-2-3 and 5-6-7 swapped.** The count is anchored on the first foot of the first complete quick-quick-slow group. If needed, force the beat-1 foot with `rhythm.count_one_foot` (`"L"` or `"R"`).
 - **High reprojection error in `calibration`.** Usually a bad sync offset, or a camera that doesn't see the whole body.
 
-## 7. Modules
+## 8. Modules
 | Module | Role |
 |---|---|
 | `landmarks.py` | MediaPipe 33-landmark index constants |
@@ -111,15 +147,17 @@ Any warnings follow the table: an audio/visual sync disagreement, low music-alig
 | `epoch_segmenter.py` | Foot-only motion energy, adaptive hysteresis, gap merging and short-burst removal. Epochs are trimmed to actual foot motion |
 | `salsa_rhythm.py` | Footfalls at touchdown with sub-frame timing, L/R alternation and TAPs, QUICK/SLOW and 8-count labels, beat offsets, step lengths, summaries |
 | `visualize.py` | `rhythm_analysis.png` |
-| `main.py` | Config loading and merging, batch orchestration, exports, summary table |
+| `main.py` | Config loading and merging, batch orchestration, exports, summary table, overlay step |
+| `overlay_video.py` | Skeleton + rhythm HUD rendered onto cam1, H.264 + audio via ffmpeg |
+| `dashboard.py` | Local Spanish tempo dashboard (`http.server`): synced player, scorecard, coaching, clickable timeline and table |
 
 Each stage also has its own CLI for debugging (`pose_2d.py`, `sync.py`, `music_analyzer.py`).
 
-## 8. Tests
+## 9. Tests
 ```bash
 pytest -q
 ```
-46 synthetic tests; no video, audio or model files are needed. They include an end-to-end run of `main.py` on two simulated subjects:
+75 synthetic tests (`tests/test_pipeline.py`, `tests/test_overlay_dashboard.py`); no video, audio or model files are needed. They include an end-to-end run of `main.py` on two simulated subjects:
 - a timeline of 10 s idle with a clap, 16 s of 180 BPM basic steps, 8 s idle, and 16 s more stepping;
 - each subject projected into two virtual cameras;
 - checks: sync, epoch boundaries, zero idle/clap false steps, 100% QUICK/SLOW and beat-count accuracy, beat offsets including a deliberate 60 ms late drift, and all exported files.
