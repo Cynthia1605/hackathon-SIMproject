@@ -728,6 +728,7 @@ def test_e2e_sync_and_epoch_boundaries(e2e_run, sid):
     rep = e2e_run["reports"][sid]
     assert rep["sync"]["method"] == "clap"
     assert rep["sync"]["frame_offset"] == SUBJECTS[sid][1]
+    assert len(rep["beat_grid_sec"]) > 100 and np.median(np.diff(rep["beat_grid_sec"])) == pytest.approx(BEAT, rel=0.01)
     eps = rep["epochs"]
     assert len(eps) == 2
     for ep, (w0, w1) in zip(eps, ACTIVE_WINDOWS):

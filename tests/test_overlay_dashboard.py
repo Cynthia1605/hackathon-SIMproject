@@ -1,4 +1,4 @@
-"""Overlay rendering and dashboard tests on synthetic data (no real video or model needed)."""
+"""Overlay (v2) and dashboard (v2) tests on synthetic data (no real video or model needed)."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ PATTERN = [(1, "L", "QUICK"), (2, "R", "QUICK"), (3, "L", "SLOW"), (5, "R", "QUI
 def make_report(offsets_fn=lambda i, beat, foot: 0.0, epochs=((2.0, 10.0),), mp3_offset=0.5, phase_beats=0,
                 qqs=1.0):
     """Steps on a 180 BPM grid inside each epoch; offsets_fn(i, beat, foot) gives ms."""
-    grid = mp3_offset + np.arange(0, 60) * PERIOD
+    grid = mp3_offset + np.arange(0, 80) * PERIOD
     steps = []
     for eid, (a, b) in enumerate(epochs):
         idx = np.flatnonzero((grid >= a + 0.2) & (grid <= b - 0.2))
@@ -65,7 +65,7 @@ def make_report(offsets_fn=lambda i, beat, foot: 0.0, epochs=((2.0, 10.0),), mp3
 
 
 def skeleton_kp(w=640, h=360) -> np.ndarray:
-    """A plausible standing 2D skeleton (33, 3) in pixels."""
+    """A plausible standing 2D skeleton (33, 3) in pixels (subject's left = image right)."""
     cx, top, bh = w / 2, 0.12 * h, 0.8 * h
     rel = {
         0: (0, 0.05), 2: (0.02, 0.03), 5: (-0.02, 0.03), 7: (0.04, 0.05), 8: (-0.04, 0.05),
@@ -81,37 +81,93 @@ def skeleton_kp(w=640, h=360) -> np.ndarray:
     return kp
 
 
+def close(px, bgr, tol=12):
+    return all(abs(int(a) - int(b)) <= tol for a, b in zip(px, bgr))
+
+
 # --------------------------------------------------------------------------- #
-# Overlay: pure logic
+# Overlay: English labels & rhythm state
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("off,cat,label", [
-    (0, "on_time", "A TIEMPO"), (45, "on_time", "A TIEMPO"), (-45, "on_time", "A TIEMPO"),
-    (-46, "slight", "LEVEMENTE ADELANTADO"), (60, "slight", "LEVEMENTE ATRASADO"), (90, "slight", "LEVEMENTE ATRASADO"),
-    (91, "off", "FUERA DE TEMPO"), (-150, "off", "FUERA DE TEMPO"), (None, "none", "SIN REFERENCIA"),
+    (0, "on_time", "ON TIME"), (45, "on_time", "ON TIME"), (-45, "on_time", "ON TIME"),
+    (-46, "early", "EARLY"), (60, "late", "LATE"), (90, "late", "LATE"),
+    (91, "off_late", "LATE / OFF-BEAT"), (-150, "off_early", "EARLY / OFF-BEAT"), (None, "none", "NO BEAT REF"),
 ])
-def test_classify_offset_thresholds(off, cat, label):
+def test_classify_offset_thresholds_english(off, cat, label):
     assert OV.classify_offset(off) == (cat, label)
 
 
+def test_offset_badges():
+    assert OV.offset_badge(12) == "ON TIME (+12ms)"
+    assert OV.offset_badge(-68) == "EARLY (-68ms)"
+    assert OV.offset_badge(115) == "LATE / OFF-BEAT (+115ms)"
+    assert OV.CATEGORY_BGR["on_time"] == OV.GREEN and OV.CATEGORY_BGR["early"] == OV.AMBER
+    assert OV.CATEGORY_BGR["off_late"] == OV.RED
+    assert OV.LEFT_COL == OV.hex_bgr("#00E5FF") and OV.RIGHT_COL == OV.hex_bgr("#FF4081")
+
+
 def test_timeline_count_phase_and_state():
-    rep = make_report(epochs=((2.0, 10.0), (14.0, 20.0)), phase_beats=0)
+    rep = make_report(epochs=((2.0, 10.0), (14.0, 20.0)))
     tl = OV.RhythmTimeline.from_report(rep)
-    for s in rep["steps"]:  # the beat count at each step's own beat matches its label
+    for s in rep["steps"]:
         assert tl.beat_count_at(s["nearest_music_beat_sec"] + 0.01) == s["beat_count"]
     first = rep["steps"][0]
     assert tl.beat_count_at(first["nearest_music_beat_sec"] + 3 * PERIOD + 0.01) == 4  # the hold beat
+    assert tl.beat_progress_at(first["nearest_music_beat_sec"] + PERIOD / 2) == pytest.approx(0.5, abs=0.01)
     idle = tl.state_at(12.0)
-    assert idle["active"] is False and idle["status"] == "EN PAUSA / IDLE"
+    assert idle["active"] is False and idle["status"] == "IDLE"
     act = tl.state_at(first["timestamp_sec"] + 0.05)
-    assert act["active"] and act["status"] == "BAILANDO / ACTIVO"
-    assert act["last_step"]["label"] == "L1" and act["feedback_label"] == "A TIEMPO" and act["step_flash"]
-    assert tl.state_at(0.5)["last_step"] is None
-    counts = [b["count"] for b in tl.beats_with_counts()]
-    assert set(c for c in counts if c is not None) == set(range(1, 9))
+    assert act["active"] and act["status"] == "DANCING"
+    co = act["callouts"]
+    assert len(co) == 1 and co[0]["foot_label"] == "LEFT FOOT" and co[0]["beat"] == 1
+    assert co[0]["badge"] == "ON TIME (+0ms)" and not co[0]["is_error"]
+    assert tl.state_at(first["timestamp_sec"] + 0.7)["callouts"][0]["foot"] == "R"  # L1 expired, R2 shown
+    assert tl.state_at(0.5)["callouts"] == []
+
+
+def test_state_error_callouts_and_flash():
+    rep = make_report(lambda i, beat, foot: 115.0 if beat == 3 else (-68.0 if beat == 2 else 10.0))
+    tl = OV.RhythmTimeline.from_report(rep)
+    s3 = next(s for s in rep["steps"] if s["beat_count"] == 3)
+    st = tl.state_at(s3["timestamp_sec"] + 0.1)
+    c3 = next(c for c in st["callouts"] if c["beat"] == 3)
+    assert c3["is_error"] and c3["category"] == "off_late" and c3["badge"] == "LATE / OFF-BEAT (+115ms)"
+    assert c3["foot_label"] == "LEFT FOOT"
+    c2 = next((c for c in st["callouts"] if c["beat"] == 2), None)
+    if c2 is not None:
+        assert c2["badge"] == "EARLY (-68ms)" and c2["category"] == "early"
+    assert 3 in st["error_flash"] and st["error_flash"][3] == pytest.approx(0.1, abs=1e-6)
+    assert tl.state_at(s3["timestamp_sec"] + 0.7)["error_flash"].get(3) is None  # flash over after 0.6 s
+    ok, n = st["on_time"]
+    assert n >= 3 and ok < n
+
+
+def _half_time_report():
+    """Report whose song grid is half-time (librosa octave error) but steps were scored at full tempo."""
+    rep = make_report(lambda i, b, f: 20.0)
+    grid = np.asarray(rep["music"]["aligned_beat_times_sec"])
+    rep["music"]["aligned_beat_times_sec"] = grid[::2].tolist()  # every other beat only
+    rep["music"]["beat_period_sec"] = 2 * PERIOD
+    rep["music"]["bpm"] = 90.0
+    return rep, grid
+
+
+def test_octave_corrected_grid_used_for_counts_and_rescoring():
+    rep, full = _half_time_report()
+    np.testing.assert_allclose(OV.analysis_beat_grid(rep)[:20], full[:20])
+    tl = OV.RhythmTimeline.from_report(rep)
+    for s in rep["steps"]:
+        assert tl.beat_count_at(s["nearest_music_beat_sec"] + 0.01) == s["beat_count"]
+    d = DB.build_dashboard_data(rep, mp3_offset=0.5 + 0.01)
+    offs = [s["offset_ms"] for s in d["steps"]]
+    assert max(abs(o) for o in offs) <= PERIOD * 500 + 1  # never more than half a (real) beat
+    assert all(abs(o - 10.0) < 1 for o in offs)
+    # an exported grid takes precedence
+    rep["beat_grid_sec"] = full.tolist()
+    np.testing.assert_allclose(OV.analysis_beat_grid(rep), full)
 
 
 def test_timeline_per_epoch_phase():
-    # Epoch 2 starts its count 2 beats later in the grid: phases must differ per epoch
     rep = make_report(epochs=((2.0, 10.0),))
     rep2 = make_report(epochs=((14.0, 22.0),), phase_beats=2)
     for s in rep2["steps"]:
@@ -126,22 +182,23 @@ def test_timeline_per_epoch_phase():
 # --------------------------------------------------------------------------- #
 # Overlay: drawing
 # --------------------------------------------------------------------------- #
-def test_draw_skeleton_highlights_lower_body():
+def test_skeleton_visual_hierarchy():
     frame = np.zeros((360, 640, 3), np.uint8)
     kp = skeleton_kp()
     OV.draw_skeleton(frame, kp, scale=0.5)
     lx, ly = kp[L.LEFT_ANKLE, :2].astype(int)
     rx, ry = kp[L.RIGHT_ANKLE, :2].astype(int)
-    assert tuple(frame[ly, lx]) == OV.NEON_LEFT
-    assert tuple(frame[ry, rx]) == OV.NEON_RIGHT
-    # knee-ankle segment midpoint is drawn neon (thick lower-body line)
-    mx, my = ((kp[L.LEFT_KNEE, :2] + kp[L.LEFT_ANKLE, :2]) / 2).astype(int) if hasattr(L, "LEFT_KNEE") else \
-        ((kp[25, :2] + kp[27, :2]) / 2).astype(int)
-    assert tuple(frame[my, mx]) == OV.NEON_LEFT
-    # upper body is drawn thinner/white
-    sx, sy = kp[L.LEFT_SHOULDER, :2].astype(int)
-    assert frame[sy, sx].min() > 200
-    # invisible joints are not drawn
+    assert close(frame[ly, lx], OV.LEFT_COL, 2)  # crisp electric cyan joint
+    assert close(frame[ry, rx], OV.RIGHT_COL, 2)  # crisp magenta/coral joint
+    mx, my = ((kp[25, :2] + kp[27, :2]) / 2).astype(int)
+    assert close(frame[my, mx], OV.LEFT_COL, 2)  # leg line
+    # glow halo just beside the leg line: tinted, but not full intensity
+    halo = frame[my, mx + 7].astype(int)
+    assert 0 < halo.max() < 230
+    # upper body is faint: ~35% of the slate colour on black
+    sx, sy = ((kp[11, :2] + kp[13, :2]) / 2).astype(int)
+    px = frame[sy, sx].astype(int)
+    assert 10 < px.max() <= int(0.4 * max(OV.UPPER_COL)) + 2
     f2 = np.zeros_like(frame)
     kp2 = kp.copy()
     kp2[:, 2] = 0.1
@@ -149,25 +206,65 @@ def test_draw_skeleton_highlights_lower_body():
     assert f2.max() == 0
 
 
-def test_draw_hud_badges_and_count():
+def test_callout_beside_offending_foot():
+    rep = make_report(lambda i, beat, foot: 115.0 if beat == 3 else 0.0)
+    tl = OV.RhythmTimeline.from_report(rep)
+    s3 = next(s for s in rep["steps"] if s["beat_count"] == 3)
+    frame = np.zeros((360, 640, 3), np.uint8)
+    kp = skeleton_kp()
+    st = tl.state_at(s3["timestamp_sec"] + 0.2)
+    drawn = OV.draw_callouts(frame, st, kp)
+    d3 = next(d for d in drawn if d["foot"] == "L")
+    cx, cy = d3["center"]
+    foot = OV.foot_center(kp, "L")
+    assert abs(cx - foot[0]) <= 1 and abs(cy - foot[1]) <= 1
+    assert d3["category"] == "off_late"
+    # red ring around the left foot
+    ring = frame[cy, cx - d3["ring_r"] - 1 : cx - d3["ring_r"] + 3]
+    assert any(close(p, OV.RED, 40) for p in ring)
+    # the tag sits beside the foot, on the outside of the body (left foot = image right here)
+    tx, ty, tw, th = d3["tag"]
+    hips_x = kp[[23, 24], 0].mean()
+    assert tx > hips_x and abs(tx - cx) < 120 and ty < cy
+    # no callouts once the 0.6 s window has passed
+    assert OV.draw_callouts(np.zeros_like(frame), tl.state_at(s3["timestamp_sec"] + 0.65), kp) == [] or \
+        all(d["foot"] != "L" for d in OV.draw_callouts(np.zeros_like(frame), tl.state_at(s3["timestamp_sec"] + 0.65), kp))
+
+
+def test_beat_strip_active_and_error_flash():
+    rep = make_report(lambda i, beat, foot: 115.0 if beat == 3 else 0.0)
+    tl = OV.RhythmTimeline.from_report(rep)
+    s1 = rep["steps"][0]
+    s3 = next(s for s in rep["steps"] if s["beat_count"] == 3)
+
+    def cell_px(frame, box, n):
+        x0, y0, sw, sh = box
+        s = frame.shape[0] / 720.0
+        cells_x0 = x0 + int(84 * s)
+        gap = int(6 * s)
+        cw = (x0 + sw - int(10 * s) - cells_x0 - 7 * gap) // 8
+        return frame[y0 + int(12 * s), cells_x0 + (n - 1) * (cw + gap) + 3]
+
+    f1 = np.full((360, 640, 3), 80, np.uint8)
+    box = OV.draw_beat_strip(f1, tl.state_at(s1["nearest_music_beat_sec"] + 0.05))
+    assert close(cell_px(f1, box, 1), OV.BEAT_ON, 25)  # beat 1 lit amber
+    assert not close(cell_px(f1, box, 2), OV.BEAT_ON, 25)
+    f3 = np.full((360, 640, 3), 80, np.uint8)
+    box = OV.draw_beat_strip(f3, tl.state_at(s3["timestamp_sec"] + 0.05))
+    assert close(cell_px(f3, box, 3), OV.RED, 40)  # error on beat 3 flashes red (wins over active)
+    assert box[1] + box[3] <= 360 and box[1] > 280  # strip at the bottom
+
+
+def test_draw_hud_status_english():
     rep = make_report()
     tl = OV.RhythmTimeline.from_report(rep)
     s0 = rep["steps"][0]
     active = np.full((360, 640, 3), 255, np.uint8)
     OV.draw_hud(active, tl.state_at(s0["timestamp_sec"] + 0.05), skeleton_kp())
     idle = np.full((360, 640, 3), 255, np.uint8)
-    OV.draw_hud(idle, tl.state_at(14.0))  # > 2.5 s after the last step: no step feedback
-    # translucent dark panel in the top-left corner, video untouched elsewhere
-    assert active[100:110, 200:260].mean() < 200
-    assert (active[150:, 480:] == 255).all()  # (the footfall ring sits around the ankle)
-    # status badge colour: green when active, grey when idle
-    pa = active[16, 16].astype(int)  # badge padding, away from anti-aliased text
-    pi = idle[16, 16].astype(int)
-    assert tuple(pa) == OV.GREEN and tuple(pi) == OV.GREY
-    # feedback badge (green, "A TIEMPO") appears only once a step has happened
-    green_rows = np.all(active == np.array(OV.GREEN, np.uint8), axis=2).sum(axis=1)
-    assert (green_rows[60:] > 20).any()
-    assert not np.all(idle == np.array(OV.GREEN, np.uint8), axis=2).any()
+    OV.draw_hud(idle, tl.state_at(14.0))
+    assert close(active[17, 10], OV.GREEN, 22) and close(idle[17, 10], OV.GREY, 22)  # chip padding, 94% opaque
+    assert (active[150:250, 520:] == 255).all()  # video untouched away from HUD/feet
 
 
 def _write_synthetic_video(path: Path, n: int = 48, w: int = 640, h: int = 360):
@@ -175,8 +272,7 @@ def _write_synthetic_video(path: Path, n: int = 48, w: int = 640, h: int = 360):
 
     wr = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (w, h))
     for i in range(n):
-        f = np.full((h, w, 3), 60 + i, np.uint8)
-        wr.write(f)
+        wr.write(np.full((h, w, 3), 60 + i, np.uint8))
     wr.release()
 
 
@@ -216,8 +312,8 @@ def test_render_overlay_opencv_only(synthetic_assets):
     assert len(frames) == 48
     kp = skeleton_kp()
     x, y = kp[L.LEFT_ANKLE, :2].astype(int)
-    b, g, r = frames[20][y, x].astype(int)  # neon cyan (lossy codec: approximate)
-    assert b > 180 and g > 180 and r < 90
+    b, g, r = frames[20][y, x].astype(int)  # electric cyan (lossy codec: approximate)
+    assert b > 170 and g > 160 and r < 100
 
 
 def test_render_overlay_ffmpeg_h264(synthetic_assets):
@@ -234,7 +330,7 @@ def test_render_overlay_ffmpeg_h264(synthetic_assets):
 
 
 # --------------------------------------------------------------------------- #
-# Dashboard: scoring, verdicts, coaching
+# Dashboard: scoring, verdicts, coaching (English)
 # --------------------------------------------------------------------------- #
 def test_timing_credit_and_score():
     half = PERIOD * 500
@@ -245,149 +341,236 @@ def test_timing_credit_and_score():
     assert DB.tempo_score([], half, 1.0) is None
 
 
-def test_dashboard_perfect_dancer_is_excellent():
+def test_dashboard_excellent_dancer():
     rng = np.random.default_rng(1)
     d = DB.build_dashboard_data(make_report(lambda i, b, f: float(rng.normal(0, 12))))
-    assert d["verdict"]["texto"] == "¡Excelente ritmo! En tempo" and d["verdict"]["nivel"] == "excelente"
+    assert d["verdict"]["text"] == "Excellent rhythm — on tempo" and d["verdict"]["level"] == "excellent"
     assert d["score"] >= 90
-    assert d["kpis"]["pct_a_tiempo"] > 95 and d["kpis"]["bpm"] == 180.0
-    assert d["kpis"]["precision_qqs"] == 100.0
-    assert any("1 y 5 caen a tiempo" in n["texto"] for n in d["coaching"])
-    assert d["steps"][0]["category_es"] == "A tiempo"
+    k = d["kpis"]
+    assert k["on_tempo_pct"] > 95 and k["bpm"] == 180.0 and k["qqs_accuracy_pct"] == 100.0
+    assert any("Beats 1 and 5 land on time" in n["text"] for n in d["coaching"])
+    s0 = d["steps"][0]
+    assert s0["status"] == "On Time" and s0["foot"] == "L" and s0["beat"] == 1 and not s0["is_error"]
     json.dumps(d, ensure_ascii=False)
 
 
 def test_dashboard_rushing_dancer():
     d = DB.build_dashboard_data(make_report(lambda i, b, f: -60.0 + (i % 3) * 5))
-    assert "adelantarse" in d["verdict"]["texto"]
-    assert d["kpis"]["desfase_promedio_ms"] < -50
-    assert any("adelantados" in n["texto"] for n in d["coaching"])
-    assert {s["category"] for s in d["steps"]} == {"slight_early"}
+    assert "rush" in d["verdict"]["text"]
+    assert d["kpis"]["mean_offset_ms"] < -50 and d["kpis"]["n_errors"] == d["kpis"]["n_steps"]
+    assert any("come early" in n["text"] for n in d["coaching"])
+    assert {s["status"] for s in d["steps"]} == {"Early"} and all(s["is_error"] for s in d["steps"])
 
 
 def test_dashboard_off_tempo_dancer():
     rng = np.random.default_rng(2)
     d = DB.build_dashboard_data(make_report(lambda i, b, f: float(rng.choice([-1, 1]) * rng.uniform(110, 160)),
                                             qqs=0.4))
-    assert d["verdict"]["texto"] == "Fuera de tiempo" and d["score"] < 50
-    assert any("regularidad" in n["texto"] or "Fuera" in n["texto"] or "1 y 5" in n["texto"] for n in d["coaching"])
+    assert d["verdict"]["text"] == "Off tempo" and d["score"] < 50
+    assert {s["status"] for s in d["steps"]} <= {"Early (off-beat)", "Late (off-beat)"}
 
 
-def test_coaching_slow_steps_rush_and_asymmetry_and_drift():
+def test_coaching_slow_rush_asymmetry_drift():
     rush = DB.build_dashboard_data(make_report(lambda i, beat, foot: -70.0 if beat in (3, 7) else 0.0))
-    texts = " ".join(n["texto"] for n in rush["coaching"])
-    assert "3 y 7 se apresuran" in texts and "1 y 5 caen a tiempo" in texts
-
+    texts = " ".join(n["text"] for n in rush["coaching"])
+    assert "Slow steps 3 and 7 rush" in texts and "Beats 1 and 5 land on time" in texts
     asym = DB.build_dashboard_data(make_report(lambda i, beat, foot: 60.0 if foot == "R" else 5.0))
-    texts = " ".join(n["texto"] for n in asym["coaching"])
-    assert "pie derecho es menos preciso" in texts
-
+    assert "Right foot is less precise" in " ".join(n["text"] for n in asym["coaching"])
     sym = DB.build_dashboard_data(make_report(lambda i, beat, foot: 10.0))
-    assert "Buena simetría" in " ".join(n["texto"] for n in sym["coaching"])
-
-    drift = make_report(lambda i, b, f: 0.0 if i < 20 else 70.0, epochs=((2.0, 10.0), (14.0, 22.0)))
+    assert "Good left/right symmetry" in " ".join(n["text"] for n in sym["coaching"])
+    drift = make_report(epochs=((2.0, 10.0), (14.0, 22.0)))
     for s in drift["steps"]:
         s["beat_offset_ms"] = 0.0 if s["epoch_id"] == 0 else 70.0
-    texts = " ".join(n["texto"] for n in DB.build_dashboard_data(drift)["coaching"])
-    assert "tiendes a atrasarte" in texts
+    assert "drifts later" in " ".join(n["text"] for n in DB.build_dashboard_data(drift)["coaching"])
 
 
-def test_dashboard_flags_suspected_offbeat_grid():
+def test_offbeat_grid_warning_and_wrapped_offsets():
     rng = np.random.default_rng(3)
-    d = DB.build_dashboard_data(make_report(lambda i, b, f: 150.0 + float(rng.normal(0, 8))))
-    assert any("contratiempo" in w for w in d["warnings"])
     wrapped = DB.build_dashboard_data(make_report(lambda i, b, f: (150.0 if i % 2 else -150.0) + float(rng.normal(0, 8))))
-    assert any("contratiempo" in w for w in wrapped["warnings"])
-    texts = " ".join(n["texto"] for n in wrapped["coaching"])
-    assert "caen a tiempo" not in texts and "Buena simetría" not in texts  # +/- offsets must not cancel out
-    assert "irregulares" in texts and "Ambos pies" in texts
+    assert any("off-beat" in w for w in wrapped["warnings"])
+    texts = " ".join(n["text"] for n in wrapped["coaching"])
+    assert "land on time" not in texts and "Good left/right symmetry" not in texts
+    assert "irregular" in texts and "Both feet" in texts
     ok = DB.build_dashboard_data(make_report(lambda i, b, f: float(rng.normal(0, 8))))
-    assert not any("contratiempo" in w for w in ok["warnings"])
+    assert not any("off-beat" in w for w in ok["warnings"])
+
+
+def test_shift_report_rescoring():
+    rep = make_report(lambda i, b, f: 60.0)  # dancer consistently 60 ms late
+    d0 = DB.build_dashboard_data(rep)
+    assert d0["kpis"]["on_tempo_pct"] == 0
+    d1 = DB.build_dashboard_data(rep, mp3_offset=0.5 + 0.06)  # move the music 60 ms later
+    assert d1["mp3_offset_sec"] == pytest.approx(0.56) and d1["mp3_offset_analyzed_sec"] == pytest.approx(0.5)
+    assert d1["kpis"]["on_tempo_pct"] == 100 and abs(d1["kpis"]["mean_offset_ms"]) < 1
+    assert d1["beats"][0]["t"] == pytest.approx(0.56)
+    assert rep["music"]["mp3_offset_sec"] == 0.5  # original untouched
+    # a shift of more than half a beat wraps to the nearest beat
+    d2 = DB.build_dashboard_data(rep, mp3_offset=0.5 + PERIOD)
+    assert abs(d2["kpis"]["mean_offset_ms"] - 60) < 1
 
 
 def test_dashboard_without_steps():
     rep = make_report()
     rep["steps"] = []
     d = DB.build_dashboard_data(rep)
-    assert d["score"] is None and d["verdict"]["texto"] == "Sin pasos detectados"
-    assert d["coaching"] and d["kpis"]["n_pasos"] == 0
+    assert d["score"] is None and d["verdict"]["text"] == "No steps detected"
+    assert d["coaching"] and d["kpis"]["n_steps"] == 0
+
+
+def test_page_is_english_single_screen():
+    html = DB.INDEX_HTML
+    for s in ("Rhythm Dashboard", "Coaching diagnosis", "Step error timeline", "Rhythm error &amp; step log",
+              "Errors only", "All steps", "Tap Beat 1 Now", "Save Offset to sessions.json", "Music offset",
+              "Time (s)", "Foot", "Beat", "Error (ms)", "Status", "0.5x", "0.75x", "1.0x"):
+        assert s in html, s
+    assert "height:100vh" in html and "overflow:hidden" in html and "grid-template-columns:minmax(0,55fr) minmax(0,45fr)" in html
+    for spanish in ("Veredicto", "Pasos", "cámara lenta", "Recomendaciones", "Desfase"):
+        assert spanish not in html
+    assert "<script src=" not in html  # self-contained
 
 
 # --------------------------------------------------------------------------- #
-# Dashboard: HTTP server
+# Dashboard: HTTP server, save-offset endpoint
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 def server(tmp_path):
     video = tmp_path / "overlay_cam1.mp4"
     video.write_bytes(bytes(range(256)) * 40)
-    audio = tmp_path / "song.mp3"
-    audio.write_bytes(b"ID3" + b"\x00" * 1000)
+    audio = tmp_path / "song_sync.wav"
+    audio.write_bytes(b"RIFF" + b"\x00" * 1000)
     (tmp_path / "secret.txt").write_text("no")
-    data = DB.build_dashboard_data(make_report(), {"video": True, "video_is_overlay": True, "audio": True})
-    srv = DB.make_server(data, video, audio, "127.0.0.1", 0)
+    cfg = {"sessions": [{"id": "s1", "cam1": "a.mp4", "cam2": "b.mp4", "song_mp3": "s.mp3", "height_meters": 1.7,
+                         "overrides": {"frame_offset": 3, "mp3_offset_sec": None}, "params": {"x": 1}},
+                        {"id": "s2", "cam1": "c.mp4", "cam2": "d.mp4", "song_mp3": "s.mp3", "height_meters": 1.6}]}
+    cfg_path = tmp_path / "sessions.json"
+    cfg_path.write_text(json.dumps(cfg))
+    media = {"video": True, "video_is_overlay": True, "audio": True, "audio_format": "wav"}
+    srv = DB.make_server(make_report(), media, video, audio, "127.0.0.1", 0,
+                         save_cb=lambda v: DB.save_offset_to_config(cfg_path, "s1", v))
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
-    yield f"http://127.0.0.1:{srv.server_address[1]}", video
+    yield f"http://127.0.0.1:{srv.server_address[1]}", video, cfg_path
     srv.shutdown()
     srv.server_close()
 
 
-def _get(url, headers=None):
-    req = urllib.request.Request(url, headers=headers or {})
+def _req(url, data=None, headers=None, method=None):
+    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     with urllib.request.urlopen(req, timeout=5) as r:
         return r.status, dict(r.headers), r.read()
 
 
 def test_server_serves_page_and_data(server):
-    base, _ = server
-    st, hd, body = _get(base + "/")
-    html = body.decode("utf-8")
-    assert st == 200 and "text/html" in hd["Content-Type"]
-    for s in ("Veredicto general de tempo", "Pasos detectados", "cámara lenta", "Metrónomo", "Ajuste de audio"):
-        assert s in html
-    assert "<script src=" not in html  # self-contained, no CDN
-    st, hd, body = _get(base + "/api/data")
+    base, _, _ = server
+    st, hd, body = _req(base + "/")
+    assert st == 200 and "text/html" in hd["Content-Type"] and b"Rhythm Dashboard" in body
+    st, _, body = _req(base + "/api/data")
     d = json.loads(body)
-    assert st == 200 and d["subject_id"] == "synthetic" and d["steps"]
-
-
-def test_server_range_requests_for_seeking(server):
-    base, video = server
-    raw = video.read_bytes()
-    st, hd, body = _get(base + "/media/video", {"Range": "bytes=100-199"})
-    assert st == 206 and body == raw[100:200]
-    assert hd["Content-Range"] == f"bytes 100-199/{len(raw)}" and hd["Accept-Ranges"] == "bytes"
-    st, hd, body = _get(base + "/media/video", {"Range": "bytes=-50"})
-    assert st == 206 and body == raw[-50:]
-    st, hd, body = _get(base + "/media/video")
-    assert st == 200 and body == raw and hd["Content-Type"] == "video/mp4"
-    st, hd, _ = _get(base + "/media/audio", {"Range": "bytes=0-9"})
-    assert st == 206 and hd["Content-Type"] == "audio/mpeg"
+    assert d["subject_id"] == "synthetic" and d["steps"] and d["media"]["can_save"] is True
+    st, _, body = _req(base + "/api/data?mp3_offset=0.6")
+    assert json.loads(body)["mp3_offset_sec"] == pytest.approx(0.6)
     with pytest.raises(urllib.error.HTTPError) as e:
-        _get(base + "/media/video", {"Range": f"bytes={len(raw) + 10}-"})
+        _req(base + "/api/data?mp3_offset=nan")
+    assert e.value.code == 400
+
+
+def test_server_range_requests(server):
+    base, video, _ = server
+    raw = video.read_bytes()
+    st, hd, body = _req(base + "/media/video", headers={"Range": "bytes=100-199"})
+    assert st == 206 and body == raw[100:200] and hd["Content-Range"] == f"bytes 100-199/{len(raw)}"
+    st, hd, body = _req(base + "/media/video", headers={"Range": "bytes=-50"})
+    assert st == 206 and body == raw[-50:]
+    st, hd, _ = _req(base + "/media/audio", headers={"Range": "bytes=0-9"})
+    assert st == 206 and hd["Content-Type"] == "audio/wav"
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _req(base + "/media/video", headers={"Range": f"bytes={len(raw) + 10}-"})
     assert e.value.code == 416
 
 
-@pytest.mark.parametrize("path", ["/secret.txt", "/media/../secret.txt", "/media/other", "/api/../secret.txt"])
+@pytest.mark.parametrize("path", ["/secret.txt", "/media/../secret.txt", "/media/other", "/sessions.json"])
 def test_server_only_serves_whitelisted_routes(server, path):
-    base, _ = server
+    base, _, _ = server
     with pytest.raises(urllib.error.HTTPError) as e:
-        _get(base + path)
+        _req(base + path)
     assert e.value.code == 404
 
 
-def test_load_subject_falls_back_to_original_video(tmp_path):
+def test_save_offset_endpoint_persists(server):
+    base, _, cfg_path = server
+    st, _, body = _req(base + "/api/save-offset", json.dumps({"mp3_offset_sec": 1.23456}).encode(),
+                       {"Content-Type": "application/json", "Origin": base})
+    res = json.loads(body)
+    assert st == 200 and res["ok"] and res["mp3_offset_sec"] == pytest.approx(1.2346)
+    cfg = json.loads(cfg_path.read_text())
+    s1, s2 = cfg["sessions"]
+    assert s1["overrides"] == {"frame_offset": 3, "mp3_offset_sec": 1.2346}  # other overrides kept
+    assert s1["params"] == {"x": 1} and "overrides" not in s2  # rest of the file untouched
+    _, _, body = _req(base + "/api/data")
+    assert json.loads(body)["media"]["saved_offset"] == pytest.approx(1.2346)
+
+
+@pytest.mark.parametrize("data,headers,code", [
+    (b'{"mp3_offset_sec": 1.0}', {"Content-Type": "text/plain"}, 415),  # simple (CSRF-able) request refused
+    (b'{"mp3_offset_sec": 1.0}', {"Content-Type": "application/json", "Origin": "http://evil.example"}, 403),
+    (b'{"mp3_offset_sec": "abc"}', {"Content-Type": "application/json"}, 400),
+    (b'{"mp3_offset_sec": 1e9}', {"Content-Type": "application/json"}, 400),
+    (b'{"wrong": 1}', {"Content-Type": "application/json"}, 400),
+    (b'not json', {"Content-Type": "application/json"}, 400),
+])
+def test_save_offset_rejects_bad_requests(server, data, headers, code):
+    base, _, cfg_path = server
+    before = cfg_path.read_text()
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _req(base + "/api/save-offset", data, headers)
+    assert e.value.code == code
+    assert cfg_path.read_text() == before
+
+
+def test_save_offset_read_only(tmp_path):
+    srv = DB.make_server(make_report(), {"video": False, "audio": False}, None, None, "127.0.0.1", 0, save_cb=None)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _req(base + "/api/save-offset", b'{"mp3_offset_sec": 1.0}', {"Content-Type": "application/json"})
+        assert e.value.code == 403
+        assert json.loads(_req(base + "/api/data")[2])["media"]["can_save"] is False
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_save_offset_to_config_validation(tmp_path):
+    p = tmp_path / "sessions.json"
+    p.write_text(json.dumps({"sessions": [{"id": "a"}]}))
+    assert DB.save_offset_to_config(p, "a", -0.25)["mp3_offset_sec"] == -0.25
+    assert json.loads(p.read_text())["sessions"][0]["overrides"]["mp3_offset_sec"] == -0.25
+    with pytest.raises(KeyError):
+        DB.save_offset_to_config(p, "nope", 1.0)
+    with pytest.raises(ValueError):
+        DB.save_offset_to_config(p, "a", float("inf"))
+
+
+def test_load_subject_prepares_wav_and_falls_back_to_original_video(tmp_path):
+    ffmpeg = OV.find_ffmpeg()
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "cam1.mp4").write_bytes(b"x")
     out = tmp_path / "outputs" / "s1"
     out.mkdir(parents=True)
     (out / "epochs_and_steps.json").write_text(json.dumps(make_report()))
+    song = tmp_path / "data" / "song.mp3"
+    if ffmpeg:
+        subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                        str(song)], check=True)
     cfg = {"sessions": [{"id": "s1", "cam1": "data/cam1.mp4", "cam2": "data/cam2.mp4", "song_mp3": "data/song.mp3",
                          "height_meters": 1.7}]}
     (tmp_path / "sessions.json").write_text(json.dumps(cfg))
-    data, video, audio, notes = DB.load_subject(str(tmp_path / "sessions.json"), "s1")
-    assert video == tmp_path / "data" / "cam1.mp4" and audio is None
-    assert data["media"]["video"] and not data["media"]["video_is_overlay"]
-    assert any("overlay_video.py" in n for n in notes) and any(".mp3" in n for n in notes)
+    report, media, video, audio, notes, sid = DB.load_subject(str(tmp_path / "sessions.json"), "s1")
+    assert sid == "s1" and video == tmp_path / "data" / "cam1.mp4" and not media["video_is_overlay"]
+    assert any("overlay_video.py" in n for n in notes)
+    if ffmpeg:
+        assert audio == out / "song_sync.wav" and audio.read_bytes()[:4] == b"RIFF" and media["audio_format"] == "wav"
     with pytest.raises(SystemExit):
         DB.load_subject(str(tmp_path / "sessions.json"), "nope")

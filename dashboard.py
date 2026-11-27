@@ -1,50 +1,64 @@
-"""Local tempo-evaluation dashboard (Spanish UI), served with the standard library.
+"""Local rhythm dashboard (English UI), served with the standard library.
 
     python dashboard.py --config sessions.json --subject subject_01
 
-It serves the overlay video, the clean song, and an interactive page with the
-tempo scorecard, coaching notes, a clickable step timeline and a step table.
-It only binds to 127.0.0.1 by default.
+A single-screen widescreen page with no outer scrolling:
+* Left: the overlay video with transport, speed and audio-sync calibration, and the
+  step error timeline.
+* Right: tempo score and KPIs, coaching diagnosis, and a filterable step / error log.
+
+Music sync: the song is served as a WAV copy decoded by ffmpeg when available, so
+seeks are sample-accurate. The browser keeps ``audio.currentTime`` locked to
+``video.currentTime - mp3_offset_sec`` with a requestAnimationFrame loop.
+
+The page can save a calibrated offset back to ``sessions.json``
+(``overrides.mp3_offset_sec``) via ``POST /api/save-offset``.
+Binds to 127.0.0.1 by default.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
+import math
 import mimetypes
+import os
 import re
+import subprocess
+import tempfile
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
-from overlay_video import ON_TIME_MS, SLIGHT_MS, RhythmTimeline, classify_offset
+from overlay_video import ON_TIME_MS, SLIGHT_MS, RhythmTimeline, analysis_beat_grid, classify_offset, find_ffmpeg
 
 log = logging.getLogger(__name__)
 
 BIAS_MS = 25.0  # |mean offset| above this counts as a tendency to rush or drag
-CATEGORY_ES = {
-    "on_time": "A tiempo",
-    "slight_early": "Levemente adelantado",
-    "slight_late": "Levemente atrasado",
-    "off": "Fuera de tempo",
-    "none": "Sin referencia",
+MAX_OFFSET_S = 600.0
+STATUS_EN = {
+    "on_time": "On Time",
+    "early": "Early",
+    "late": "Late",
+    "off_early": "Early (off-beat)",
+    "off_late": "Late (off-beat)",
+    "none": "No beat ref",
 }
-TIMING_ES = {"QUICK": "Rápido", "SLOW": "Lento", "TAP": "Toque"}
+TIMING_EN = {"QUICK": "Quick", "SLOW": "Slow", "TAP": "Tap"}
 
 
 # --------------------------------------------------------------------------- #
 # Scoring, verdict and coaching (pure functions, unit-tested)
 # --------------------------------------------------------------------------- #
 def step_category(offset_ms: float | None) -> str:
-    cat, _ = classify_offset(offset_ms)
-    if cat == "slight":
-        return "slight_early" if offset_ms < 0 else "slight_late"
-    return cat
+    return classify_offset(offset_ms)[0]
 
 
 def timing_credit(abs_ms: float, half_beat_ms: float) -> float:
@@ -70,68 +84,68 @@ def tempo_score(offsets_ms: list[float], half_beat_ms: float, qqs_accuracy: floa
 
 def verdict(score: float | None, bias_ms: float | None) -> dict[str, str]:
     if score is None:
-        return {"nivel": "sin_datos", "texto": "Sin pasos detectados",
-                "detalle": "No se detectaron pasos contados con referencia musical."}
+        return {"level": "none", "text": "No steps detected",
+                "detail": "No counted steps with a music beat reference were found."}
     early = bias_ms is not None and bias_ms < -BIAS_MS
     late = bias_ms is not None and bias_ms > BIAS_MS
     if score >= 85 and not (early or late):
-        return {"nivel": "excelente", "texto": "¡Excelente ritmo! En tempo",
-                "detalle": "Los pasos caen sobre el pulso de la música de forma estable."}
+        return {"level": "excellent", "text": "Excellent rhythm — on tempo",
+                "detail": "Steps land on the music's pulse consistently."}
     if score >= 70:
         if early:
-            return {"nivel": "bueno", "texto": "Buen ritmo, con tendencia a adelantarse",
-                    "detalle": "Vas en tempo, pero tiendes a pisar antes del pulso."}
+            return {"level": "good", "text": "Good rhythm, tends to rush",
+                    "detail": "Mostly on tempo, but steps tend to land before the beat."}
         if late:
-            return {"nivel": "bueno", "texto": "Buen ritmo, con tendencia a atrasarse",
-                    "detalle": "Vas en tempo, pero tiendes a pisar después del pulso."}
-        return {"nivel": "bueno", "texto": "Buen ritmo",
-                "detalle": "La mayoría de los pasos caen a tiempo; hay algo de irregularidad."}
+            return {"level": "good", "text": "Good rhythm, tends to drag",
+                    "detail": "Mostly on tempo, but steps tend to land after the beat."}
+        return {"level": "good", "text": "Good rhythm",
+                "detail": "Most steps land on time, with some irregular ones."}
     if score >= 50:
         if early:
-            return {"nivel": "regular", "texto": "Tendencia a adelantarse",
-                    "detalle": "Muchos pasos llegan antes del pulso. Escucha la percusión y espera el tiempo."}
+            return {"level": "fair", "text": "Tends to rush (early)",
+                    "detail": "Many steps land before the beat. Listen for the percussion and wait for it."}
         if late:
-            return {"nivel": "regular", "texto": "Tendencia a atrasarse",
-                    "detalle": "Muchos pasos llegan después del pulso. Anticipa el movimiento del pie."}
-        return {"nivel": "regular", "texto": "Ritmo inconsistente",
-                "detalle": "Algunos pasos caen a tiempo y otros no; trabaja la regularidad."}
-    return {"nivel": "malo", "texto": "Fuera de tiempo",
-            "detalle": "La mayoría de los pasos no coinciden con el pulso de la música."}
+            return {"level": "fair", "text": "Tends to drag (late)",
+                    "detail": "Many steps land after the beat. Prepare the weight change earlier."}
+        return {"level": "fair", "text": "Inconsistent timing",
+                "detail": "Some steps are on time and others are not. Work on regularity."}
+    return {"level": "poor", "text": "Off tempo",
+            "detail": "Most steps do not line up with the music's pulse."}
 
 
 def _mean(xs):
     return float(np.mean(xs)) if len(xs) else None
 
 
-def _fmt_ms(v: float) -> str:
+def _ms(v: float) -> str:
     return f"{v:+.0f} ms"
 
 
 def coaching_notes(steps: list[dict], period_s: float, n_taps: int = 0) -> list[dict[str, str]]:
-    """Spanish coaching notes derived from step timing patterns."""
+    """English coaching notes derived from step timing patterns. kind: ok | warn | info."""
     notes: list[dict[str, str]] = []
     c = [s for s in steps if s.get("timing_type") != "TAP" and s.get("beat_offset_ms") is not None]
     if not c:
-        return [{"tipo": "info", "texto": "No hay suficientes pasos con referencia musical para dar recomendaciones."}]
+        return [{"kind": "info", "text": "Not enough steps with a beat reference to give feedback."}]
 
     def offs(pred):
         return [s["beat_offset_ms"] for s in c if pred(s)]
 
-    # Strong beats 1 and 5
+    # Strong beats 1 and 5 (judged on |offset| so +/- errors cannot cancel out)
     strong = offs(lambda s: s.get("beat_count") in (1, 5))
     if strong:
         m, ma = _mean(strong), _mean([abs(o) for o in strong])
         if ma <= ON_TIME_MS:
-            notes.append({"tipo": "ok", "texto": f"Los tiempos fuertes 1 y 5 caen a tiempo (promedio {_fmt_ms(m)}). ¡Muy bien!"})
+            notes.append({"kind": "ok", "text": f"Beats 1 and 5 land on time (mean {_ms(m)}). Great anchor."})
         elif abs(m) <= BIAS_MS:
-            notes.append({"tipo": "warn", "texto": f"Los tiempos 1 y 5 son irregulares: a veces antes y a veces después "
-                                                   f"del pulso (desfase medio {ma:.0f} ms). Marca el 1 con claridad."})
+            notes.append({"kind": "warn", "text": f"Beats 1 and 5 are irregular — sometimes early, sometimes late "
+                                                  f"(mean error {ma:.0f} ms). Mark the 1 clearly."})
         elif m < 0:
-            notes.append({"tipo": "warn", "texto": f"Los tiempos 1 y 5 llegan adelantados (promedio {_fmt_ms(m)}). "
-                                                   "Espera el golpe fuerte de la música antes de pisar."})
+            notes.append({"kind": "warn", "text": f"Beats 1 and 5 come early (mean {_ms(m)}). "
+                                                  "Wait for the downbeat before stepping."})
         else:
-            notes.append({"tipo": "warn", "texto": f"Los tiempos 1 y 5 llegan atrasados (promedio {_fmt_ms(m)}). "
-                                                   "Prepara el peso para pisar justo en el 1 y el 5."})
+            notes.append({"kind": "warn", "text": f"Beats 1 and 5 come late (mean {_ms(m)}). "
+                                                  "Shift your weight earlier so the step lands on 1 and 5."})
 
     # Slow steps 3 and 7 (and the 4/8 hold)
     slow = [s for s in c if s.get("timing_type") == "SLOW"]
@@ -139,19 +153,19 @@ def coaching_notes(steps: list[dict], period_s: float, n_taps: int = 0) -> list[
         m = _mean([s["beat_offset_ms"] for s in slow])
         ma = _mean([abs(s["beat_offset_ms"]) for s in slow])
         holds = [s["interval_sec"] for s in slow if s.get("interval_sec")]
-        short_hold = holds and _mean(holds) < 1.8 * period_s
+        short_hold = bool(holds) and _mean(holds) < 1.8 * period_s
         if ma > SLIGHT_MS and abs(m) <= BIAS_MS and not short_hold:
-            notes.append({"tipo": "warn", "texto": f"Los pasos lentos 3 y 7 no caen con el pulso (desfase medio {ma:.0f} ms). "
-                                                   "Cuenta en voz alta 1-2-3, 5-6-7 con la música."})
+            notes.append({"kind": "warn", "text": f"Slow steps 3 and 7 miss the pulse (mean error {ma:.0f} ms). "
+                                                  "Count 1-2-3, 5-6-7 out loud with the music."})
         elif m < -BIAS_MS or short_hold:
-            extra = f" y la pausa dura {_mean(holds):.2f} s de {2 * period_s:.2f} s" if short_hold else ""
-            notes.append({"tipo": "warn", "texto": f"Los pasos lentos 3 y 7 se apresuran (promedio {_fmt_ms(m)}{extra}). "
-                                                   "Sostén la pausa del 4 y del 8 antes de volver a pisar."})
+            extra = f"; the hold lasts {_mean(holds):.2f}s of {2 * period_s:.2f}s" if short_hold else ""
+            notes.append({"kind": "warn", "text": f"Slow steps 3 and 7 rush (mean {_ms(m)}{extra}). "
+                                                  "Hold through beats 4 and 8 before stepping again."})
         elif m > BIAS_MS:
-            notes.append({"tipo": "warn", "texto": f"Los pasos lentos 3 y 7 llegan tarde (promedio {_fmt_ms(m)}). "
-                                                   "Cierra el paso a tiempo y usa el 4 y el 8 para pausar."})
+            notes.append({"kind": "warn", "text": f"Slow steps 3 and 7 land late (mean {_ms(m)}). "
+                                                  "Close the step on time and use 4 and 8 to pause."})
         else:
-            notes.append({"tipo": "ok", "texto": f"Los pasos lentos 3 y 7 respetan la pausa del 4 y del 8 (promedio {_fmt_ms(m)})."})
+            notes.append({"kind": "ok", "text": f"Slow steps 3 and 7 respect the 4/8 hold (mean {_ms(m)})."})
 
     # Left / right symmetry
     lo = [abs(o) for o in offs(lambda s: s.get("foot") == "L")]
@@ -159,53 +173,87 @@ def coaching_notes(steps: list[dict], period_s: float, n_taps: int = 0) -> list[
     if lo and ro:
         ml, mr = _mean(lo), _mean(ro)
         if abs(ml - mr) > 20:
-            worse, better = ("izquierdo", "derecho") if ml > mr else ("derecho", "izquierdo")
-            notes.append({"tipo": "warn", "texto": f"El pie {worse} es menos preciso que el {better} "
-                                                   f"({max(ml, mr):.0f} ms vs {min(ml, mr):.0f} ms de desfase medio)."})
+            worse, better = ("Left", "right") if ml > mr else ("Right", "left")
+            notes.append({"kind": "warn", "text": f"{worse} foot is less precise than the {better} "
+                                                  f"({max(ml, mr):.0f} ms vs {min(ml, mr):.0f} ms mean error)."})
         elif max(ml, mr) > ON_TIME_MS:
-            notes.append({"tipo": "info", "texto": f"Ambos pies tienen un desfase parecido (izquierdo {ml:.0f} ms, "
-                                                   f"derecho {mr:.0f} ms): el problema es de tempo general, no de un pie."})
+            notes.append({"kind": "info", "text": f"Both feet are off by a similar amount (L {ml:.0f} ms, "
+                                                  f"R {mr:.0f} ms): this is overall tempo, not one foot."})
         else:
-            notes.append({"tipo": "ok", "texto": f"Buena simetría entre pies: izquierdo {ml:.0f} ms, derecho {mr:.0f} ms de desfase medio."})
+            notes.append({"kind": "ok", "text": f"Good left/right symmetry: L {ml:.0f} ms, R {mr:.0f} ms mean error."})
     ll = [s["step_length_cm"] for s in c if s.get("foot") == "L" and s.get("step_length_cm")]
     rl = [s["step_length_cm"] for s in c if s.get("foot") == "R" and s.get("step_length_cm")]
     if ll and rl:
         a, b = _mean(ll), _mean(rl)
         if max(a, b) > 0 and abs(a - b) / max(a, b) > 0.25:
-            big = "izquierdo" if a > b else "derecho"
-            notes.append({"tipo": "info", "texto": f"Los pasos del pie {big} son más largos ({max(a, b):.0f} cm vs "
-                                                   f"{min(a, b):.0f} cm). Pasos más cortos ayudan a llegar a tiempo."})
+            big = "Left" if a > b else "Right"
+            notes.append({"kind": "info", "text": f"{big}-foot steps are longer ({max(a, b):.0f} cm vs "
+                                                  f"{min(a, b):.0f} cm). Smaller steps make it easier to stay on time."})
 
     # Drift between dance blocks / over time
     by_epoch: dict[int, list[float]] = {}
     for s in c:
         by_epoch.setdefault(s.get("epoch_id", 0), []).append(s["beat_offset_ms"])
+    first = last = None
     if len(by_epoch) >= 2:
         ids = sorted(by_epoch)
-        first, last = _mean(by_epoch[ids[0]]), _mean(by_epoch[ids[-1]])
-        if abs(last - first) > 30:
-            word = "atrasarte" if last > first else "adelantarte"
-            notes.append({"tipo": "warn", "texto": f"Del primer al último bloque de baile tiendes a {word} "
-                                                   f"({_fmt_ms(first)} → {_fmt_ms(last)}). Mantén la concentración en el pulso."})
+        first, last, where = _mean(by_epoch[ids[0]]), _mean(by_epoch[ids[-1]]), "from the first to the last dance block"
     elif len(c) >= 12:
         half = len(c) // 2
-        first, last = _mean([s["beat_offset_ms"] for s in c[:half]]), _mean([s["beat_offset_ms"] for s in c[half:]])
-        if abs(last - first) > 30:
-            word = "atrasarte" if last > first else "adelantarte"
-            notes.append({"tipo": "warn", "texto": f"Con el paso del tiempo tiendes a {word} ({_fmt_ms(first)} → {_fmt_ms(last)})."})
+        first = _mean([s["beat_offset_ms"] for s in c[:half]])
+        last = _mean([s["beat_offset_ms"] for s in c[half:]])
+        where = "over the course of the dance"
+    if first is not None and abs(last - first) > 30:
+        word = "later (dragging)" if last > first else "earlier (rushing)"
+        notes.append({"kind": "warn", "text": f"Timing drifts {word} {where} ({_ms(first)} → {_ms(last)}). "
+                                              "Keep listening to the pulse as you tire."})
 
     std = float(np.std([s["beat_offset_ms"] for s in c]))
     if std > 60:
-        notes.append({"tipo": "warn", "texto": f"La regularidad es baja (dispersión de {std:.0f} ms). "
-                                               "Practica con el metrónomo a velocidad lenta."})
+        notes.append({"kind": "warn", "text": f"Low consistency (spread {std:.0f} ms). "
+                                              "Practise with the metronome at 0.75x speed."})
     if n_taps:
-        notes.append({"tipo": "info", "texto": f"Se detectaron {n_taps} toques (TAP) del mismo pie seguidos; "
-                                               "no cuentan como pasos. Revisa si hubo cambios de peso incompletos."})
+        notes.append({"kind": "info", "text": f"{n_taps} same-foot taps were detected and not counted as steps. "
+                                              "Check for incomplete weight changes."})
     return notes
 
 
-def build_dashboard_data(report: dict[str, Any], media: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Everything the web page needs, derived from epochs_and_steps.json."""
+def shift_report(report: dict[str, Any], new_offset: float) -> dict[str, Any]:
+    """Copy of the report with the music placed at ``new_offset``.
+
+    The beat grid is shifted and each step's offset is recomputed against the
+    nearest shifted beat.
+    """
+    rep = copy.deepcopy(report)
+    music = rep.setdefault("music", {})
+    old = float(music.get("mp3_offset_sec") or 0.0)
+    d = float(new_offset) - old
+    grid = analysis_beat_grid(report) + d  # the (tempo-corrected) grid the steps are scored against
+    music["aligned_beat_times_sec"] = (np.asarray(music.get("aligned_beat_times_sec") or [], dtype=np.float64) + d).tolist()
+    rep["beat_grid_sec"] = grid.tolist()
+    music["mp3_offset_sec"] = float(new_offset)
+    period = float((rep.get("summary") or {}).get("beat_period_sec") or music.get("beat_period_sec") or 0.5)
+    for s in rep.get("steps", []):
+        if len(grid) == 0 or s.get("beat_offset_ms") is None:
+            continue
+        t = s["timestamp_sec"]
+        if t < grid[0] - period / 2 or t > grid[-1] + period / 2:
+            s["nearest_music_beat_sec"], s["beat_offset_ms"] = None, None
+            continue
+        nb = float(grid[np.argmin(np.abs(grid - t))])
+        s["nearest_music_beat_sec"], s["beat_offset_ms"] = nb, (t - nb) * 1000.0
+    return rep
+
+
+def build_dashboard_data(report: dict[str, Any], media: dict[str, Any] | None = None,
+                         mp3_offset: float | None = None) -> dict[str, Any]:
+    """Everything the web page needs, derived from epochs_and_steps.json.
+
+    If ``mp3_offset`` is given, the steps are re-scored with the music at that offset.
+    """
+    analyzed_offset = float((report.get("music") or {}).get("mp3_offset_sec") or 0.0)
+    if mp3_offset is not None and abs(float(mp3_offset) - analyzed_offset) > 1e-9:
+        report = shift_report(report, float(mp3_offset))
     music = report.get("music", {}) or {}
     summary = report.get("summary", {}) or {}
     period = float(summary.get("beat_period_sec") or music.get("beat_period_sec") or 0.5)
@@ -220,50 +268,54 @@ def build_dashboard_data(report: dict[str, Any], media: dict[str, Any] | None = 
 
     warnings = list(report.get("warnings", []))
     if len(offs) >= 8:
-        # Steps cluster tightly around half a beat: the detected beat grid is probably
-        # on the off-beat (beat-phase error), not the dancer. Flag it; never auto-correct.
-        # Use |offset|: near half a beat, offsets wrap between +P/2 and -P/2.
+        # |offset| clusters tightly near half a beat: the beat grid is probably on the
+        # off-beat (beat-phase error), not the dancer. Flag it; never auto-correct.
         absd = np.abs(np.asarray(offs, dtype=np.float64))
         if absd.mean() > 0.3 * period * 1000 and absd.std() < 0.15 * period * 1000:
             warnings.append(
-                f"Los pasos caen de forma muy regular a ~{absd.mean():.0f} ms del pulso (casi medio tiempo). "
-                "Es posible que la detección de beats de la canción esté en el contratiempo. "
-                "Verifica con el metrónomo y, si es así, corrige overrides.mp3_offset_sec.")
+                f"Steps land very regularly ~{absd.mean():.0f} ms from the beat (almost half a beat). "
+                "The song's beat grid is probably on the off-beat: check with the metronome, "
+                "then use 'Tap Beat 1' or the offset controls and save.")
 
     timeline = RhythmTimeline.from_report(report)
     steps_out = []
     for i, s in enumerate(steps_all):
-        cat = step_category(s.get("beat_offset_ms")) if s.get("timing_type") != "TAP" else "none"
+        tap = s.get("timing_type") == "TAP"
+        cat = "none" if tap else step_category(s.get("beat_offset_ms"))
+        off = s.get("beat_offset_ms")
         steps_out.append({
             "i": i, "t": s["timestamp_sec"], "foot": s.get("foot"), "label": s.get("label"),
-            "timing_type": s.get("timing_type"), "tipo": TIMING_ES.get(s.get("timing_type"), s.get("timing_type")),
-            "beat_count": s.get("beat_count"), "offset_ms": s.get("beat_offset_ms"),
-            "category": cat, "category_es": CATEGORY_ES[cat], "epoch_id": s.get("epoch_id"),
-            "step_length_cm": s.get("step_length_cm"), "cam1_frame": s.get("cam1_frame"),
+            "timing_type": s.get("timing_type"), "type": TIMING_EN.get(s.get("timing_type"), s.get("timing_type")),
+            "beat": s.get("beat_count"), "offset_ms": off, "category": cat,
+            "status": "Tap" if tap else STATUS_EN[cat],
+            "is_error": (not tap) and off is not None and abs(off) > ON_TIME_MS,
+            "epoch_id": s.get("epoch_id"), "step_length_cm": s.get("step_length_cm"),
         })
     epochs = [{"id": e["epoch_id"], "start": e["start_sec"], "end": e["end_sec"]} for e in report.get("epochs", [])]
     t_end = max([e["end"] for e in epochs] + [s["t"] for s in steps_out] + [0.0])
+    n_err = sum(s["is_error"] for s in steps_out)
     return {
         "subject_id": report.get("subject_id", ""),
         "fps": report.get("fps"),
         "bpm": music.get("bpm"),
         "beat_period_ms": period * 1000.0,
         "mp3_offset_sec": float(music.get("mp3_offset_sec") or 0.0),
+        "mp3_offset_analyzed_sec": analyzed_offset,
         "music_method": music.get("method"),
         "music_confidence": music.get("confidence"),
         "score": score,
         "verdict": verdict(score, bias),
         "kpis": {
             "bpm": music.get("bpm"),
-            "step_bpm": (60.0 / period) if period else None,
-            "pct_a_tiempo": (100.0 * float(np.mean([abs(o) <= ON_TIME_MS for o in offs]))) if offs else None,
-            "desfase_promedio_ms": bias,
-            "desfase_abs_ms": _mean([abs(o) for o in offs]) if offs else None,
-            "consistencia_ms": float(np.std(offs)) if offs else None,
-            "precision_qqs": (100.0 * qqs) if qqs is not None else None,
-            "n_pasos": len(counted),
+            "on_tempo_pct": (100.0 * float(np.mean([abs(o) <= ON_TIME_MS for o in offs]))) if offs else None,
+            "mean_offset_ms": bias,
+            "mean_abs_offset_ms": _mean([abs(o) for o in offs]) if offs else None,
+            "consistency_ms": float(np.std(offs)) if offs else None,
+            "qqs_accuracy_pct": (100.0 * qqs) if qqs is not None else None,
+            "n_steps": len(counted),
+            "n_errors": n_err,
             "n_taps": n_taps,
-            "n_bloques": len(epochs),
+            "n_blocks": len(epochs),
         },
         "coaching": coaching_notes(steps_all, period, n_taps),
         "steps": steps_out,
@@ -277,14 +329,64 @@ def build_dashboard_data(report: dict[str, Any], media: dict[str, Any] | None = 
 
 
 # --------------------------------------------------------------------------- #
+# sessions.json persistence
+# --------------------------------------------------------------------------- #
+def save_offset_to_config(config_path: str | Path, subject_id: str, offset_sec: float) -> dict[str, Any]:
+    """Write ``overrides.mp3_offset_sec`` for one session, keeping the rest of the file intact."""
+    v = float(offset_sec)
+    if not math.isfinite(v) or abs(v) > MAX_OFFSET_S:
+        raise ValueError(f"mp3_offset_sec must be a finite number within ±{MAX_OFFSET_S:.0f} s")
+    path = Path(config_path)
+    cfg = json.loads(path.read_text())
+    match = [s for s in cfg.get("sessions", []) if s.get("id") == subject_id]
+    if not match:
+        raise KeyError(f"session '{subject_id}' not found in {path}")
+    overrides = match[0].get("overrides") or {}
+    previous = overrides.get("mp3_offset_sec")
+    overrides["mp3_offset_sec"] = round(v, 4)
+    match[0]["overrides"] = overrides
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)  # atomic
+    return {"ok": True, "subject_id": subject_id, "mp3_offset_sec": round(v, 4), "previous": previous,
+            "config": str(path)}
+
+
+# --------------------------------------------------------------------------- #
+# Sync-accurate audio
+# --------------------------------------------------------------------------- #
+def prepare_sync_audio(song: Path, out_dir: Path) -> Path:
+    """Decode the song to a PCM WAV next to the outputs (cached).
+
+    Browsers seek WAV sample-accurately, unlike MP3. Falls back to the original song
+    if ffmpeg is not available.
+    """
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        log.warning("ffmpeg not found: serving the original .mp3 (seeking may be less precise)")
+        return song
+    wav = out_dir / "song_sync.wav"
+    if wav.is_file() and wav.stat().st_mtime >= song.stat().st_mtime:
+        return wav
+    proc = subprocess.run([ffmpeg, "-y", "-v", "error", "-i", str(song), "-vn", "-ac", "2", "-ar", "44100",
+                           "-c:a", "pcm_s16le", str(wav)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not wav.is_file():
+        log.warning("Could not decode %s to WAV; serving the original", song)
+        return song
+    return wav
+
+
+# --------------------------------------------------------------------------- #
 # HTTP server
 # --------------------------------------------------------------------------- #
 RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
-def make_handler(data: dict[str, Any], files: dict[str, Path | None]):
+def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str, Path | None],
+                 save_cb: Callable[[float], dict[str, Any]] | None, state: dict[str, Any]):
     page = INDEX_HTML.encode("utf-8")
-    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # quiet
@@ -298,6 +400,9 @@ def make_handler(data: dict[str, Any], files: dict[str, Path | None]):
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
+
+        def _json(self, code: int, obj: Any):
+            self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
         def _file(self, path: Path):
             size = path.stat().st_size
@@ -345,28 +450,68 @@ def make_handler(data: dict[str, Any], files: dict[str, Path | None]):
             self.do_GET()
 
         def do_GET(self):
-            route = self.path.split("?", 1)[0]
+            parts = urlsplit(self.path)
+            route = parts.path
             if route in ("/", "/index.html"):
                 return self._send(200, page, "text/html; charset=utf-8")
             if route == "/api/data":
-                return self._send(200, payload, "application/json; charset=utf-8")
+                q = parse_qs(parts.query)
+                off = None
+                if "mp3_offset" in q:
+                    try:
+                        off = float(q["mp3_offset"][0])
+                        if not math.isfinite(off) or abs(off) > MAX_OFFSET_S:
+                            raise ValueError
+                    except ValueError:
+                        return self._json(400, {"ok": False, "error": "invalid mp3_offset"})
+                data = build_dashboard_data(report, dict(media, can_save=save_cb is not None,
+                                                         saved_offset=state.get("saved_offset")), off)
+                return self._json(200, data)
             if route in ("/media/video", "/media/audio"):
                 f = files.get(route.rsplit("/", 1)[-1])
                 if f is not None and Path(f).is_file():
                     return self._file(Path(f))
-            return self._send(404, "No encontrado".encode("utf-8"), "text/plain; charset=utf-8")
+            return self._send(404, b"Not found", "text/plain; charset=utf-8")
+
+        def do_POST(self):
+            if urlsplit(self.path).path != "/api/save-offset":
+                return self._send(404, b"Not found", "text/plain; charset=utf-8")
+            # CSRF guard: JSON only (forces a CORS preflight that we never approve) and same-origin.
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return self._json(415, {"ok": False, "error": "Content-Type must be application/json"})
+            origin = self.headers.get("Origin")
+            host = self.headers.get("Host", "")
+            if origin and urlsplit(origin).netloc != host:
+                return self._json(403, {"ok": False, "error": "cross-origin request refused"})
+            if save_cb is None:
+                return self._json(403, {"ok": False, "error": "saving is disabled"})
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                if n <= 0 or n > 4096:
+                    raise ValueError("bad body size")
+                body = json.loads(self.rfile.read(n))
+                res = save_cb(float(body["mp3_offset_sec"]))
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
+            state["saved_offset"] = res["mp3_offset_sec"]
+            return self._json(200, res)
 
     return Handler
 
 
-def make_server(data: dict[str, Any], video: Path | None, audio: Path | None,
-                host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
+def make_server(report: dict[str, Any], media: dict[str, Any], video: Path | None, audio: Path | None,
+                host: str = "127.0.0.1", port: int = 8765,
+                save_cb: Callable[[float], dict[str, Any]] | None = None) -> ThreadingHTTPServer:
     mimetypes.add_type("audio/mpeg", ".mp3")
+    mimetypes.add_type("audio/wav", ".wav")
     mimetypes.add_type("video/mp4", ".mp4")
-    return ThreadingHTTPServer((host, port), make_handler(data, {"video": video, "audio": audio}))
+    state: dict[str, Any] = {"saved_offset": None}
+    handler = make_handler(report, media, {"video": video, "audio": audio}, save_cb, state)
+    return ThreadingHTTPServer((host, port), handler)
 
 
-def load_subject(config: str, subject: str | None) -> tuple[dict, Path | None, Path | None, list[str]]:
+def load_subject(config: str, subject: str | None, prepare_audio: bool = True):
+    """Return (report, media, video_path, audio_path, notes, session_id)."""
     from main import load_config
 
     cfg = load_config(config)
@@ -391,34 +536,39 @@ def load_subject(config: str, subject: str | None) -> tuple[dict, Path | None, P
         video, is_overlay = overlay, True
     elif Path(sess["cam1"]).is_file():
         video, is_overlay = Path(sess["cam1"]), False
-        notes.append("Se muestra el video original (sin esqueleto). Genera el overlay con: "
+        notes.append("Showing the original video (no skeleton). Render the overlay with: "
                      f"python overlay_video.py --config {config} --subject {sess['id']}")
     else:
         video, is_overlay = None, False
-        notes.append("No se encontró el video de la cámara 1.")
-    audio = Path(sess["song_mp3"]) if Path(sess["song_mp3"]).is_file() else None
-    if audio is None:
-        notes.append("No se encontró la canción (.mp3); el metrónomo sigue disponible.")
-    data = build_dashboard_data(report, {"video": video is not None, "video_is_overlay": is_overlay,
-                                         "audio": audio is not None, "notes": notes})
-    return data, video, audio, notes
+        notes.append("cam1 video not found.")
+    song = Path(sess["song_mp3"])
+    audio = None
+    if song.is_file():
+        audio = prepare_sync_audio(song, out_dir) if prepare_audio else song
+    else:
+        notes.append("Song (.mp3) not found; the metronome still works.")
+    media = {"video": video is not None, "video_is_overlay": is_overlay, "audio": audio is not None,
+             "audio_format": audio.suffix.lstrip(".") if audio else None, "notes": notes}
+    return report, media, video, audio, notes, sess["id"]
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Panel local de evaluación de tempo (salsa)")
+    ap = argparse.ArgumentParser(description="Local rhythm / tempo dashboard")
     ap.add_argument("--config", default="sessions.json")
     ap.add_argument("--subject", help="session id (default: first session)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--read-only", action="store_true", help="disable 'Save offset to sessions.json'")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    data, video, audio, notes = load_subject(args.config, args.subject)
+    report, media, video, audio, notes, sid = load_subject(args.config, args.subject)
     for n in notes:
         log.warning(n)
-    server = make_server(data, video, audio, args.host, args.port)
+    save_cb = None if args.read_only else (lambda v: save_offset_to_config(args.config, sid, v))
+    server = make_server(report, media, video, audio, args.host, args.port, save_cb)
     url = f"http://{args.host}:{server.server_address[1]}/"
-    print(f"Panel de tempo para {data['subject_id']}: {url}  (Ctrl+C para salir)")
+    print(f"Rhythm dashboard for {sid}: {url}  (Ctrl+C to quit)")
     if not args.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
@@ -434,325 +584,388 @@ def main(argv: list[str] | None = None) -> int:
 # Page (self-contained: no external scripts, fonts or CDNs)
 # --------------------------------------------------------------------------- #
 INDEX_HTML = r"""<!doctype html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Panel de Tempo · Salsa</title>
+<title>Rhythm Dashboard</title>
 <style>
 :root{
-  --bg:#0f1218; --panel:#171b23; --panel2:#1e2430; --line:#2a3140; --text:#e8ecf3; --muted:#9aa4b5;
-  --green:#3ecf6e; --green-bg:rgba(62,207,110,.14); --yellow:#f2c230; --yellow-bg:rgba(242,194,48,.14);
-  --red:#f0525c; --red-bg:rgba(240,82,92,.14); --blue:#4aa8ff; --left:#22d3ee; --right:#e879f9; --accent:#ffb020;
+  --bg:#0b1018; --panel:#121924; --panel2:#18212f; --line:#243043; --text:#e6edf6; --muted:#8b98ab;
+  --left:#00e5ff; --right:#ff4081; --green:#22c55e; --amber:#f59e0b; --red:#ef4444; --accent:#ffc400; --blue:#60a5fa;
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
-header h1{font-size:18px;margin:0;font-weight:650;letter-spacing:.2px}
-header .sub{color:var(--muted);font-size:13px}
-main{max-width:1400px;margin:0 auto;padding:18px 24px 40px;display:grid;gap:18px}
-.grid-top{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:18px}
-@media (max-width:1000px){.grid-top{grid-template-columns:1fr}}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
-.card h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 12px;font-weight:600}
-video{width:100%;border-radius:8px;background:#000;display:block;max-height:62vh}
-.controls{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin-top:12px}
-.btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer;font:inherit}
-.btn:hover{border-color:#3b4558}
-.btn.on{background:var(--blue);border-color:var(--blue);color:#06121f;font-weight:600}
-.group{display:flex;gap:6px;align-items:center}
-.lbl{color:var(--muted);font-size:12px}
-input[type=range]{width:180px;accent-color:var(--accent)}
-label.chk{display:flex;gap:6px;align-items:center;cursor:pointer}
-.score-wrap{display:flex;gap:18px;align-items:center}
-.ring{position:relative;width:132px;height:132px;flex:none}
+html,body{height:100%}
+body{margin:0;height:100vh;overflow:hidden;display:grid;grid-template-rows:auto minmax(0,1fr);
+  background:var(--bg);color:var(--text);font:13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:16px;padding:8px 16px;border-bottom:1px solid var(--line);min-width:0}
+header h1{font-size:15px;margin:0;font-weight:650;white-space:nowrap}
+header .meta{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+.legend{display:flex;gap:12px;font-size:12px;color:var(--muted);white-space:nowrap}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px;vertical-align:0}
+main{display:grid;grid-template-columns:minmax(0,55fr) minmax(0,45fr);gap:12px;padding:10px 12px 12px;min-height:0}
+.col{display:grid;gap:8px;min-height:0;min-width:0}
+.left{grid-template-rows:minmax(0,1fr) auto auto clamp(130px,25vh,230px)}
+.right{grid-template-rows:auto auto minmax(0,1fr)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-height:0;min-width:0}
+.card h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 6px;font-weight:650;display:flex;align-items:center;gap:8px}
+.videowrap{position:relative;min-height:0;background:#000;border-radius:10px;overflow:hidden;border:1px solid var(--line)}
+.videowrap video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+.bar{display:flex;align-items:center;gap:8px;flex-wrap:nowrap;min-width:0}
+.bar .grow{flex:1;min-width:60px}
+.bar.wrap{flex-wrap:wrap;row-gap:6px}
+.btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:4px 9px;cursor:pointer;font:inherit;white-space:nowrap;line-height:1.3}
+.btn:hover{border-color:#3b4a61}
+.btn.on{background:var(--blue);border-color:var(--blue);color:#05101f;font-weight:650}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#1a1200;font-weight:650}
+.btn.icon{width:34px;padding:4px 0;text-align:center}
+.seg{display:flex}
+.seg .btn{border-radius:0;margin-left:-1px}
+.seg .btn:first-child{border-radius:7px 0 0 7px;margin-left:0} .seg .btn:last-child{border-radius:0 7px 7px 0}
+input[type=range]{accent-color:var(--accent)}
+input[type=number]{width:86px;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:4px 6px;font:inherit}
+.lbl{color:var(--muted);font-size:12px;white-space:nowrap}
+.mono{font-variant-numeric:tabular-nums}
+.chk{display:flex;gap:4px;align-items:center;cursor:pointer;white-space:nowrap;color:var(--muted)}
+.drift{font-size:12px;color:var(--muted);white-space:nowrap;min-width:84px;text-align:right}
+.drift.bad{color:var(--amber)}
+#tl{display:grid;grid-template-rows:auto minmax(0,1fr)}
+#tlsvg{width:100%;height:100%;display:block;min-height:0}
+#tlsvg .pt{cursor:pointer}
+.tip{position:fixed;pointer-events:none;background:#0b1220;border:1px solid #334155;border-radius:7px;padding:6px 9px;font-size:12px;z-index:9;display:none;white-space:nowrap;box-shadow:0 6px 20px rgba(0,0,0,.4)}
+.scorerow{display:grid;grid-template-columns:auto minmax(0,1fr);gap:12px;align-items:center}
+.ring{position:relative;width:104px;height:104px}
 .ring svg{transform:rotate(-90deg)}
 .ring .val{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
-.ring .val b{font-size:32px;line-height:1}
-.ring .val span{font-size:11px;color:var(--muted);margin-top:4px}
-.verdict{display:inline-block;padding:6px 12px;border-radius:999px;font-weight:650;font-size:15px}
-.v-excelente{background:var(--green-bg);color:var(--green)} .v-bueno{background:rgba(74,168,255,.15);color:var(--blue)}
-.v-regular{background:var(--yellow-bg);color:var(--yellow)} .v-malo{background:var(--red-bg);color:var(--red)}
-.v-sin_datos{background:var(--panel2);color:var(--muted)}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:16px}
-.kpi{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-.kpi .k{color:var(--muted);font-size:12px}
-.kpi .v{font-size:22px;font-weight:650;margin-top:2px;font-variant-numeric:tabular-nums}
-.kpi .h{color:var(--muted);font-size:11px}
-ul.coach{list-style:none;margin:0;padding:0;display:grid;gap:8px}
-ul.coach li{padding:9px 12px;border-radius:8px;border-left:4px solid var(--line);background:var(--panel2)}
-ul.coach li.ok{border-left-color:var(--green)} ul.coach li.warn{border-left-color:var(--yellow)} ul.coach li.info{border-left-color:var(--blue)}
-.adj{margin-top:10px;color:var(--muted);font-size:12px;min-height:1em}
-#chart{width:100%;height:auto;display:block;cursor:crosshair;user-select:none}
-#chart .pt{cursor:pointer}
-#chart .pt:hover{stroke:#fff;stroke-width:2}
-.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-top:8px}
-.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px}
-.tablewrap{max-height:420px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+.ring .val b{font-size:24px;line-height:1}
+.ring .val span{font-size:10px;color:var(--muted);margin-top:3px;text-transform:uppercase;letter-spacing:.06em}
+.verdict{display:inline-block;padding:4px 10px;border-radius:999px;font-weight:650;font-size:14px}
+.v-excellent{background:rgba(34,197,94,.15);color:var(--green)} .v-good{background:rgba(96,165,250,.15);color:var(--blue)}
+.v-fair{background:rgba(245,158,11,.15);color:var(--amber)} .v-poor{background:rgba(239,68,68,.15);color:var(--red)}
+.v-none{background:var(--panel2);color:var(--muted)}
+.vdetail{color:var(--muted);margin-top:4px;font-size:12px}
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:8px}
+.kpi{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 8px;min-width:0}
+.kpi .k{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi .v{font-size:18px;font-weight:650;font-variant-numeric:tabular-nums;white-space:nowrap}
+.kpi .h{color:var(--muted);font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#coachCard ul{list-style:none;margin:0;padding:0;display:grid;gap:5px;max-height:clamp(70px,20vh,190px);overflow:auto}
+#coachCard li{padding:6px 9px;border-radius:7px;border-left:3px solid var(--line);background:var(--panel2);font-size:12.5px}
+#coachCard li.ok{border-left-color:var(--green)} #coachCard li.warn{border-left-color:var(--amber)} #coachCard li.info{border-left-color:var(--blue)}
+.warnline{color:var(--amber);font-size:12px;margin-top:6px}
+#logCard{display:grid;grid-template-rows:auto minmax(0,1fr)}
+.tablewrap{overflow:auto;min-height:0;border:1px solid var(--line);border-radius:8px}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
-th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
-th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-weight:600;font-size:12px;z-index:1}
-tbody tr{cursor:pointer} tbody tr:hover{background:#202838} tbody tr.cur{background:rgba(255,176,32,.14)}
-.tag{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600}
-.c-on_time{background:var(--green-bg);color:var(--green)} .c-slight_early,.c-slight_late{background:var(--yellow-bg);color:var(--yellow)}
-.c-off{background:var(--red-bg);color:var(--red)} .c-none{background:var(--panel2);color:var(--muted)}
-.foot-L{color:var(--left);font-weight:600} .foot-R{color:var(--right);font-weight:600}
-.notes{color:var(--yellow);font-size:12px;margin-top:8px}
-.beatbar{display:flex;gap:6px;margin-top:10px}
-.beatbar span{flex:1;text-align:center;padding:6px 0;border-radius:6px;background:var(--panel2);color:var(--muted);font-weight:650}
-.beatbar span.hold{opacity:.55}
-.beatbar span.cur{background:var(--accent);color:#1a1200}
+th,td{padding:5px 9px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-weight:600;font-size:11.5px;z-index:1}
+tbody tr{cursor:pointer} tbody tr:hover{background:#1b2534} tbody tr.cur{background:rgba(255,196,0,.13)}
+.foot-L{color:var(--left);font-weight:650} .foot-R{color:var(--right);font-weight:650}
+.tag{padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:650}
+.c-on_time{background:rgba(34,197,94,.15);color:var(--green)} .c-early,.c-late{background:rgba(245,158,11,.15);color:var(--amber)}
+.c-off_early,.c-off_late{background:rgba(239,68,68,.17);color:var(--red)} .c-none{background:var(--panel2);color:var(--muted)}
+.toast{position:fixed;right:16px;bottom:16px;background:#0b1220;border:1px solid #334155;border-radius:8px;padding:9px 12px;display:none;max-width:460px;z-index:10;font-size:12.5px}
+.spacer{flex:1}
 </style>
 </head>
 <body>
 <header>
-  <div><h1>Panel de Tempo · <span id="subj"></span></h1><div class="sub" id="hdrsub"></div></div>
-  <div class="sub">Tiempos: <b style="color:var(--green)">a tiempo ≤ ±45 ms</b> · <b style="color:var(--yellow)">leve ≤ ±90 ms</b> · <b style="color:var(--red)">fuera &gt; 90 ms</b></div>
+  <h1>Rhythm Dashboard · <span id="subj"></span></h1>
+  <div class="meta" id="meta"></div>
+  <div class="legend">
+    <span><i class="dot" style="background:var(--left)"></i>Left foot</span>
+    <span><i class="dot" style="background:var(--right)"></i>Right foot</span>
+    <span><i class="dot" style="background:var(--green)"></i>On time ≤ ±45 ms</span>
+    <span><i class="dot" style="background:var(--amber)"></i>Early/Late ≤ 90 ms</span>
+    <span><i class="dot" style="background:var(--red)"></i>Off-beat &gt; 90 ms</span>
+  </div>
 </header>
 <main>
-  <div class="grid-top">
-    <section class="card">
-      <h2>Video y música sincronizados</h2>
-      <video id="video" src="media/video" preload="auto" playsinline controls muted></video>
-      <div class="beatbar" id="beatbar"></div>
-      <div class="controls">
-        <div class="group"><span class="lbl">Velocidad</span>
-          <button class="btn" data-rate="0.5">0.5× cámara lenta</button>
-          <button class="btn" data-rate="0.75">0.75×</button>
-          <button class="btn on" data-rate="1">1.0× normal</button>
-        </div>
-        <label class="chk"><input type="checkbox" id="musicOn" checked> Música (.mp3)</label>
-        <label class="chk"><input type="checkbox" id="camAudio"> Audio de la cámara</label>
-        <label class="chk"><input type="checkbox" id="metroOn"> Metrónomo (1-2-3, 5-6-7)</label>
+  <div class="col left">
+    <div class="videowrap"><video id="video" src="media/video" preload="auto" playsinline muted></video></div>
+    <div class="card bar" style="padding:6px 10px">
+      <button class="btn icon" id="play" title="Play / pause (space)">▶</button>
+      <span class="mono lbl" id="time">0.00 / 0.00 s</span>
+      <input type="range" class="grow" id="scrub" min="0" max="1000" value="0" step="1">
+      <div class="seg" id="speeds">
+        <button class="btn" data-rate="0.5">0.5x</button><button class="btn" data-rate="0.75">0.75x</button><button class="btn on" data-rate="1">1.0x</button>
       </div>
-      <div class="controls">
-        <div class="group"><span class="lbl">Ajuste de audio</span>
-          <button class="btn" id="dminus">−10 ms</button>
-          <input type="range" id="delta" min="-500" max="500" step="5" value="0">
-          <button class="btn" id="dplus">+10 ms</button>
-          <button class="btn" id="dreset">Restablecer</button>
-        </div>
-        <span class="lbl" id="deltaTxt"></span>
-      </div>
-      <div class="notes" id="notes"></div>
-    </section>
-    <section class="card">
-      <h2>Veredicto general de tempo</h2>
-      <div class="score-wrap">
+      <label class="chk"><input type="checkbox" id="musicOn" checked>Music</label>
+      <label class="chk"><input type="checkbox" id="camAudio">Cam audio</label>
+      <label class="chk"><input type="checkbox" id="metroOn">Metronome</label>
+    </div>
+    <div class="card bar wrap" style="padding:6px 10px">
+      <span class="lbl">Music offset</span>
+      <input type="number" id="offset" step="0.001" title="mp3_offset_sec: cam1 time at which the song starts (s)">
+      <span class="lbl">s</span>
+      <button class="btn" data-nudge="-50">−50ms</button><button class="btn" data-nudge="-10">−10</button>
+      <button class="btn" data-nudge="10">+10</button><button class="btn" data-nudge="50">+50ms</button>
+      <button class="btn primary" id="tap" title="Press exactly when you hear/see beat 1 in the video">Tap Beat 1 Now</button>
+      <button class="btn" id="reset" title="Back to the analysed offset">Reset</button>
+      <span class="spacer"></span>
+      <button class="btn" id="save">Save Offset to sessions.json</button>
+      <span class="drift mono" id="drift">sync –</span>
+    </div>
+    <div class="card" id="tl">
+      <h2>Step error timeline <span class="lbl" style="text-transform:none;letter-spacing:0">● left · ◆ right · click a step to replay from 1 s before</span></h2>
+      <svg id="tlsvg"></svg>
+    </div>
+  </div>
+
+  <div class="col right">
+    <div class="card">
+      <div class="scorerow">
         <div class="ring">
-          <svg width="132" height="132" viewBox="0 0 132 132">
-            <circle cx="66" cy="66" r="56" fill="none" stroke="#2a3140" stroke-width="12"/>
-            <circle id="ringArc" cx="66" cy="66" r="56" fill="none" stroke="#3ecf6e" stroke-width="12" stroke-linecap="round" stroke-dasharray="0 999"/>
+          <svg width="104" height="104" viewBox="0 0 104 104">
+            <circle cx="52" cy="52" r="45" fill="none" stroke="#243043" stroke-width="8"/>
+            <circle id="arc" cx="52" cy="52" r="45" fill="none" stroke="#22c55e" stroke-width="8" stroke-linecap="round" stroke-dasharray="0 999"/>
           </svg>
-          <div class="val"><b id="score">–</b><span>Puntuación</span></div>
+          <div class="val"><b id="score">–</b><span>Tempo</span></div>
         </div>
-        <div>
+        <div style="min-width:0">
           <div class="verdict" id="verdict"></div>
-          <p id="verdictDet" style="color:var(--muted);margin:10px 0 0"></p>
+          <div class="vdetail" id="vdetail"></div>
         </div>
       </div>
       <div class="kpis" id="kpis"></div>
-      <div class="adj" id="adjTxt"></div>
-      <h2 style="margin-top:18px">Recomendaciones</h2>
-      <ul class="coach" id="coach"></ul>
-    </section>
+    </div>
+    <div class="card" id="coachCard">
+      <h2>Coaching diagnosis</h2>
+      <ul id="coach"></ul>
+      <div class="warnline" id="warn"></div>
+    </div>
+    <div class="card" id="logCard">
+      <h2>Rhythm error &amp; step log <span class="spacer"></span>
+        <span class="seg"><button class="btn on" id="fAll">All steps</button><button class="btn" id="fErr">Errors only</button></span>
+      </h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Time (s)</th><th>Foot</th><th>Beat</th><th>Error (ms)</th><th>Status</th></tr></thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
-
-  <section class="card">
-    <h2>Línea de tiempo de pasos · desfase respecto al pulso (clic para saltar al video)</h2>
-    <svg id="chart" viewBox="0 0 1000 300" preserveAspectRatio="none"></svg>
-    <div class="legend">
-      <span><i style="background:var(--green)"></i>A tiempo</span>
-      <span><i style="background:var(--yellow)"></i>Levemente adelantado / atrasado</span>
-      <span><i style="background:var(--red)"></i>Fuera de tempo</span>
-      <span>● Paso rápido &nbsp; ■ Paso lento &nbsp; ✕ Toque</span>
-      <span>Negativo = adelantado · Positivo = atrasado</span>
-    </div>
-  </section>
-
-  <section class="card">
-    <h2>Pasos detectados (clic en una fila para saltar al video)</h2>
-    <div class="tablewrap">
-      <table>
-        <thead><tr><th>#</th><th>Tiempo</th><th>Bloque</th><th>Pie</th><th>Paso</th><th>Tipo</th><th>Cuenta</th><th>Desfase</th><th>Veredicto</th><th>Long. paso</th></tr></thead>
-        <tbody id="tbody"></tbody>
-      </table>
-    </div>
-  </section>
 </main>
+<div class="tip" id="tip"></div>
+<div class="toast" id="toast"></div>
 
 <script>
 (async function(){
-const D = await (await fetch('api/data')).json();
 const $ = id => document.getElementById(id);
+let D = await (await fetch('api/data')).json();
 const video = $('video');
 const audio = D.media.audio ? new Audio('media/audio') : null;
-if (audio) audio.preload = 'auto';
-const periodMs = D.beat_period_ms, halfMs = periodMs / 2, TH = D.thresholds;
-let delta = 0; // user audio offset adjustment (s); positive = music later
+if (audio){ audio.preload = 'auto'; audio.preservesPitch = true; }
+const ANALYZED = D.mp3_offset_analyzed_sec;
+let offset = D.mp3_offset_sec;           // current mp3_offset_sec (cam1 time of song t=0)
+let filterErrors = false;
+const fmt = (v, d=0) => (v == null || Number.isNaN(v)) ? '–' : Number(v).toFixed(d);
+const sgn = (v, d=0) => v == null ? '–' : (v > 0 ? '+' : '') + Number(v).toFixed(d);
+const COL = {on_time:'#22c55e', early:'#f59e0b', late:'#f59e0b', off_early:'#ef4444', off_late:'#ef4444', none:'#64748b'};
+const FOOT = {L:'#00e5ff', R:'#ff4081'};
+function toast(msg, ms=4500){ const t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = 'none', ms); }
 
-// ---------- header, notes ----------
-$('subj').textContent = D.subject_id;
-$('hdrsub').textContent = `BPM ${fmt(D.bpm,1)} · alineación musical: ${D.music_method || '–'}` +
-  (D.music_confidence != null ? ` (confianza ${fmt(D.music_confidence,2)})` : '') + ` · offset mp3 ${fmt(D.mp3_offset_sec,3)} s`;
-$('notes').textContent = [...(D.media.notes || []), ...(D.warnings || [])].join(' · ');
-if (!D.media.video) video.replaceWith(Object.assign(document.createElement('div'), {textContent: 'Video no disponible', className: 'notes'}));
-
-function fmt(v, d=0){ return (v == null || Number.isNaN(v)) ? '–' : Number(v).toFixed(d); }
-function sgn(v, d=0){ return v == null ? '–' : (v > 0 ? '+' : '') + Number(v).toFixed(d); }
-function mmss(t){ const m = Math.floor(t/60), s = t - 60*m; return `${m}:${s.toFixed(2).padStart(5,'0')}`; }
-function catOf(off){ if (off == null) return 'none'; const a = Math.abs(off);
-  return a <= TH.on_time_ms ? 'on_time' : a <= TH.slight_ms ? (off < 0 ? 'slight_early' : 'slight_late') : 'off'; }
-const CAT_ES = {on_time:'A tiempo', slight_early:'Levemente adelantado', slight_late:'Levemente atrasado', off:'Fuera de tempo', none:'Sin referencia'};
-const CAT_COL = {on_time:'#3ecf6e', slight_early:'#f2c230', slight_late:'#f2c230', off:'#f0525c', none:'#7b8494'};
-// offset after the live audio adjustment, wrapped to the nearest beat
-function adjOff(off){ if (off == null) return null; let o = off - delta*1000;
-  o = ((o + halfMs) % periodMs + periodMs) % periodMs - halfMs; return o; }
-
-// ---------- scorecard ----------
-const v = D.verdict;
-$('verdict').textContent = v.texto; $('verdict').className = 'verdict v-' + v.nivel;
-$('verdictDet').textContent = v.detalle;
-const sc = D.score;
-$('score').textContent = sc == null ? '–' : Math.round(sc) + '%';
-const C = 2*Math.PI*56, arcCol = v.nivel === 'excelente' ? '#3ecf6e' : v.nivel === 'bueno' ? '#4aa8ff' : v.nivel === 'regular' ? '#f2c230' : '#f0525c';
-$('ringArc').setAttribute('stroke-dasharray', `${C*(sc||0)/100} ${C}`); $('ringArc').setAttribute('stroke', arcCol);
-const K = D.kpis;
-const kpis = [
-  ['BPM detectado', fmt(K.bpm,1), `pulso ${fmt(periodMs,0)} ms`],
-  ['Pasos a tiempo', K.pct_a_tiempo == null ? '–' : fmt(K.pct_a_tiempo,0)+'%', `${K.n_pasos} pasos · ±${TH.on_time_ms} ms`],
-  ['Desfase promedio', K.desfase_promedio_ms == null ? '–' : sgn(K.desfase_promedio_ms,0)+' ms',
-     K.desfase_promedio_ms == null ? '' : (K.desfase_promedio_ms < -25 ? 'adelantado' : K.desfase_promedio_ms > 25 ? 'atrasado' : 'centrado') + ` · |medio| ${fmt(K.desfase_abs_ms,0)} ms`],
-  ['Consistencia', K.consistencia_ms == null ? '–' : '±'+fmt(K.consistencia_ms,0)+' ms', 'desviación estándar'],
-  ['Precisión 1-2-3 / 5-6-7', K.precision_qqs == null ? '–' : fmt(K.precision_qqs,0)+'%', `${K.n_bloques} bloques · ${K.n_taps} toques`],
-];
-$('kpis').innerHTML = '';
-for (const [k, val, h] of kpis){ const d = document.createElement('div'); d.className='kpi';
-  d.innerHTML = '<div class="k"></div><div class="v"></div><div class="h"></div>';
-  d.children[0].textContent = k; d.children[1].textContent = val; d.children[2].textContent = h; $('kpis').appendChild(d); }
-for (const n of D.coaching){ const li = document.createElement('li'); li.className = n.tipo; li.textContent = n.texto; $('coach').appendChild(li); }
-
-// ---------- 8-count bar ----------
-const tokens = ['1','2','3','(4)','5','6','7','(8)'];
-tokens.forEach((t,i) => { const s = document.createElement('span'); s.textContent = t; if (i===3||i===7) s.classList.add('hold'); $('beatbar').appendChild(s); });
-const beats = D.beats || [];
-function countAt(t){ // t in cam1 time, with audio adjustment
-  let lo = 0, hi = beats.length - 1, k = -1;
-  while (lo <= hi){ const m = (lo+hi)>>1; if (beats[m].t + delta <= t){ k = m; lo = m+1; } else hi = m-1; }
-  if (k < 0 || t - (beats[k].t + delta) > 1.5*periodMs/1000) return null;
-  return beats[k].count;
+// ======================= rendering of analysis data =======================
+function renderHeader(){
+  $('subj').textContent = D.subject_id;
+  $('meta').textContent = `${fmt(D.bpm,1)} BPM · beat ${fmt(D.beat_period_ms,0)} ms · music alignment: ${D.music_method || '–'}` +
+    (D.music_confidence != null ? ` (conf ${fmt(D.music_confidence,2)})` : '') +
+    ` · analysed offset ${fmt(ANALYZED,3)} s` + (D.media.audio_format ? ` · audio: ${D.media.audio_format}` : '');
 }
-
-// ---------- table ----------
-const tbody = $('tbody');
-const rows = D.steps.map(s => {
-  const tr = document.createElement('tr');
-  const cells = [s.i+1, mmss(s.t), s.epoch_id != null ? '#'+s.epoch_id : '–', s.foot === 'L' ? 'Izq.' : 'Der.', s.label, s.tipo,
-                 s.beat_count ?? '–', '', '', s.step_length_cm != null ? fmt(s.step_length_cm,0)+' cm' : '–'];
-  cells.forEach((c, j) => { const td = document.createElement('td'); td.textContent = c; if (j===3) td.className = 'foot-'+s.foot; tr.appendChild(td); });
-  tr.addEventListener('click', () => seek(s.t));
-  tbody.appendChild(tr); return tr;
-});
-function refreshTable(){
-  D.steps.forEach((s, i) => {
-    const off = s.timing_type === 'TAP' ? null : adjOff(s.offset_ms), cat = s.timing_type === 'TAP' ? 'none' : catOf(off);
-    rows[i].children[7].textContent = off == null ? '–' : sgn(off,0)+' ms';
-    rows[i].children[8].innerHTML = ''; const tag = document.createElement('span'); tag.className = 'tag c-'+cat;
-    tag.textContent = s.timing_type === 'TAP' ? 'Toque' : CAT_ES[cat]; rows[i].children[8].appendChild(tag);
-  });
+function renderScore(){
+  const v = D.verdict, sc = D.score;
+  $('verdict').textContent = v.text; $('verdict').className = 'verdict v-' + v.level; $('vdetail').textContent = v.detail;
+  $('score').textContent = sc == null ? '–' : Math.round(sc) + '%';
+  const C = 2*Math.PI*45, col = {excellent:'#22c55e', good:'#60a5fa', fair:'#f59e0b', poor:'#ef4444'}[v.level] || '#64748b';
+  $('arc').setAttribute('stroke-dasharray', `${C*(sc||0)/100} ${C}`); $('arc').setAttribute('stroke', col);
+  const K = D.kpis, mo = K.mean_offset_ms;
+  const items = [
+    ['BPM', fmt(K.bpm,1), `beat ${fmt(D.beat_period_ms,0)} ms`],
+    ['On-tempo', K.on_tempo_pct == null ? '–' : fmt(K.on_tempo_pct,0)+'%', `${K.n_steps - K.n_errors}/${K.n_steps} steps ≤ ±45 ms`],
+    ['Mean offset', mo == null ? '–' : sgn(mo,0)+' ms', mo == null ? '' : `${mo < -25 ? 'early' : mo > 25 ? 'late' : 'centred'} · spread ±${fmt(K.consistency_ms,0)}`],
+    ['QQS accuracy', K.qqs_accuracy_pct == null ? '–' : fmt(K.qqs_accuracy_pct,0)+'%', `1-2-3 / 5-6-7 · ${K.n_blocks} blocks`],
+  ];
+  $('kpis').innerHTML = '';
+  for (const [k, val, h] of items){ const d = document.createElement('div'); d.className = 'kpi';
+    for (const [cls, txt] of [['k',k],['v',val],['h',h]]){ const e = document.createElement('div'); e.className = cls; e.textContent = txt; d.appendChild(e); }
+    $('kpis').appendChild(d); }
+  $('coach').innerHTML = '';
+  for (const n of D.coaching){ const li = document.createElement('li'); li.className = n.kind; li.textContent = n.text; $('coach').appendChild(li); }
+  $('warn').textContent = [...(D.media.notes || []), ...(D.warnings || [])].join(' · ');
 }
-
-// ---------- timeline chart ----------
-const svg = $('chart'), W = 1000, H = 300, PL = 52, PR = 12, PT = 12, PB = 30;
-const t0 = Math.max(0, Math.min(...D.epochs.map(e=>e.start), ...D.steps.map(s=>s.t), D.duration) - 1);
-const t1 = Math.max(...D.epochs.map(e=>e.end), ...D.steps.map(s=>s.t), 1) + 1;
-const yMax = Math.max(120, Math.min(halfMs, 250));
-const X = t => PL + (t - t0) / (t1 - t0) * (W - PL - PR);
-const Y = o => PT + (1 - (Math.max(-yMax, Math.min(yMax, o)) + yMax) / (2*yMax)) * (H - PT - PB);
-const NS = 'http://www.w3.org/2000/svg';
-function el(tag, attrs, parent=svg){ const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent.appendChild(e); return e; }
-let playhead;
-function drawChart(){
-  svg.innerHTML = '';
-  for (const e of D.epochs) el('rect', {x:X(e.start), y:PT, width:Math.max(1,X(e.end)-X(e.start)), height:H-PT-PB, fill:'rgba(74,168,255,.07)'});
-  el('rect', {x:PL, y:Y(TH.slight_ms), width:W-PL-PR, height:Y(-TH.slight_ms)-Y(TH.slight_ms), fill:'rgba(242,194,48,.08)'});
-  el('rect', {x:PL, y:Y(TH.on_time_ms), width:W-PL-PR, height:Y(-TH.on_time_ms)-Y(TH.on_time_ms), fill:'rgba(62,207,110,.16)'});
-  for (const o of [-yMax, -TH.slight_ms, -TH.on_time_ms, 0, TH.on_time_ms, TH.slight_ms, yMax]){
-    el('line', {x1:PL, x2:W-PR, y1:Y(o), y2:Y(o), stroke: o===0 ? '#5b6577' : '#262d3a', 'stroke-width': o===0?1.2:1});
-    const tx = el('text', {x:PL-6, y:Y(o)+4, 'text-anchor':'end', fill:'#9aa4b5', 'font-size':11}); tx.textContent = (o>0?'+':'')+Math.round(o);
-  }
-  const span = t1 - t0, stepT = span > 300 ? 60 : span > 120 ? 20 : span > 40 ? 10 : 5;
-  for (let t = Math.ceil(t0/stepT)*stepT; t <= t1; t += stepT){
-    el('line', {x1:X(t), x2:X(t), y1:H-PB, y2:H-PB+4, stroke:'#5b6577'});
-    const tx = el('text', {x:X(t), y:H-PB+17, 'text-anchor':'middle', fill:'#9aa4b5', 'font-size':11}); tx.textContent = mmss(t).replace(/\.\d+$/,'');
-  }
-  const yl = el('text', {x:14, y:(H-PB)/2, fill:'#9aa4b5', 'font-size':11, transform:`rotate(-90 14 ${(H-PB)/2})`, 'text-anchor':'middle'}); yl.textContent = 'desfase (ms)';
-  // per-epoch rolling mean
-  for (const e of D.epochs){
-    const pts = D.steps.filter(s => s.epoch_id === e.id && s.timing_type !== 'TAP' && s.offset_ms != null).map(s => [s.t, adjOff(s.offset_ms)]);
-    if (pts.length < 5) continue; let d = '';
-    for (let i = 4; i < pts.length; i++){ const m = (pts[i][1]+pts[i-1][1]+pts[i-2][1]+pts[i-3][1]+pts[i-4][1])/5; d += (d?'L':'M') + X(pts[i][0]) + ' ' + Y(m); }
-    el('path', {d, fill:'none', stroke:'#cfd6e3', 'stroke-width':1.5, 'stroke-opacity':.7});
-  }
+let rows = [];
+function renderTable(){
+  const tb = $('tbody'); tb.innerHTML = ''; rows = [];
   for (const s of D.steps){
-    const off = s.timing_type === 'TAP' ? 0 : adjOff(s.offset_ms); if (off == null) continue;
-    const cat = s.timing_type === 'TAP' ? 'none' : catOf(off), x = X(s.t), y = Y(off), col = CAT_COL[cat];
-    let p;
-    if (s.timing_type === 'SLOW') p = el('rect', {x:x-5, y:y-5, width:10, height:10, fill:col, class:'pt'});
-    else if (s.timing_type === 'TAP') p = el('path', {d:`M${x-5} ${y-5}L${x+5} ${y+5}M${x+5} ${y-5}L${x-5} ${y+5}`, stroke:col, 'stroke-width':2, class:'pt'});
-    else p = el('circle', {cx:x, cy:y, r:4.5, fill:col, class:'pt'});
-    const tt = document.createElementNS(NS, 'title');
-    tt.textContent = `${s.label} · ${mmss(s.t)} · ${s.timing_type==='TAP' ? 'Toque' : sgn(off,0)+' ms · '+CAT_ES[cat]}`; p.appendChild(tt);
-    p.addEventListener('click', ev => { ev.stopPropagation(); seek(s.t); });
+    if (filterErrors && !s.is_error) continue;
+    const tr = document.createElement('tr'); tr.dataset.i = s.i;
+    const cells = [fmt(s.t,2), s.foot, s.beat ?? '–', s.offset_ms == null || s.timing_type === 'TAP' ? '–' : sgn(s.offset_ms,0), ''];
+    cells.forEach((c, j) => { const td = document.createElement('td'); td.textContent = c; if (j===1) td.className = 'foot-'+s.foot; tr.appendChild(td); });
+    const tag = document.createElement('span'); tag.className = 'tag c-'+s.category; tag.textContent = s.status; tr.children[4].appendChild(tag);
+    tr.addEventListener('click', () => seek(s.t));
+    tb.appendChild(tr); rows.push([s, tr]);
   }
-  playhead = el('line', {x1:PL, x2:PL, y1:PT, y2:H-PB, stroke:'#ffb020', 'stroke-width':1.5});
+  $('fAll').classList.toggle('on', !filterErrors); $('fErr').classList.toggle('on', filterErrors);
+  $('fErr').textContent = `Errors only (${D.kpis.n_errors})`;
+  lastCur = null;
 }
-svg.addEventListener('click', ev => { // click on empty chart area also seeks
-  const r = svg.getBoundingClientRect(), x = (ev.clientX - r.left) / r.width * W;
-  if (x >= PL && x <= W-PR) seek(t0 + (x - PL) / (W - PL - PR) * (t1 - t0));
-});
+$('fAll').onclick = () => { filterErrors = false; renderTable(); };
+$('fErr').onclick = () => { filterErrors = true; renderTable(); };
 
-// ---------- live adjustment summary ----------
-function refreshAdj(){
-  $('deltaTxt').textContent = `${delta >= 0 ? '+' : ''}${Math.round(delta*1000)} ms · offset total ${(D.mp3_offset_sec + delta).toFixed(3)} s`;
-  if (Math.abs(delta) < 1e-9){ $('adjTxt').textContent = ''; return; }
-  const offs = D.steps.filter(s => s.timing_type !== 'TAP' && s.offset_ms != null).map(s => adjOff(s.offset_ms));
-  if (!offs.length) return;
-  const pct = 100 * offs.filter(o => Math.abs(o) <= TH.on_time_ms).length / offs.length;
-  const mean = offs.reduce((a,b)=>a+b,0) / offs.length;
-  $('adjTxt').textContent = `Con el ajuste de audio (${sgn(delta*1000,0)} ms): ${pct.toFixed(0)}% de pasos a tiempo, desfase promedio ${sgn(mean,0)} ms. La puntuación general usa la alineación original.`;
+// ---------- timeline (redrawn at real pixel size) ----------
+const svg = $('tlsvg'), NS = 'http://www.w3.org/2000/svg', tip = $('tip');
+let TL = null, playhead = null;
+function el(tag, attrs, parent=svg){ const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent.appendChild(e); return e; }
+function drawTimeline(){
+  const W = svg.clientWidth, H = svg.clientHeight; if (W < 50 || H < 40) return;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`); svg.innerHTML = '';
+  const PL = 44, PR = 8, PT = 6, PB = 18, half = D.beat_period_ms / 2;
+  const t1 = Math.max(video.duration || 0, D.duration + 1, 1), yMax = Math.max(120, Math.min(half, 250));
+  const X = t => PL + t / t1 * (W - PL - PR);
+  const Y = o => PT + (1 - (Math.max(-yMax, Math.min(yMax, o)) + yMax) / (2*yMax)) * (H - PT - PB);
+  TL = {X, PL, PR, W, H, t1, PT, PB};
+  for (const e of D.epochs) el('rect', {x:X(e.start), y:PT, width:Math.max(1, X(e.end)-X(e.start)), height:H-PT-PB, fill:'rgba(96,165,250,.06)'});
+  el('rect', {x:PL, y:Y(90), width:W-PL-PR, height:Y(-90)-Y(90), fill:'rgba(245,158,11,.06)'});
+  el('rect', {x:PL, y:Y(45), width:W-PL-PR, height:Y(-45)-Y(45), fill:'rgba(34,197,94,.17)'});
+  for (const o of [-yMax, -90, -45, 0, 45, 90, yMax]){
+    el('line', {x1:PL, x2:W-PR, y1:Y(o), y2:Y(o), stroke: o===0 ? '#475569' : '#1e293b'});
+    if (Math.abs(o) !== 45) { const tx = el('text', {x:PL-5, y:Y(o)+4, 'text-anchor':'end', fill:'#8b98ab', 'font-size':10}); tx.textContent = (o>0?'+':'')+Math.round(o); }
+  }
+  const tx45 = el('text', {x:PL+4, y:Y(45)-3, fill:'#22c55e', 'font-size':10}); tx45.textContent = '±45 ms on tempo';
+  const stepT = t1 > 300 ? 60 : t1 > 120 ? 20 : t1 > 40 ? 10 : 5;
+  for (let t = 0; t <= t1; t += stepT){ const tx = el('text', {x:X(t), y:H-4, 'text-anchor':'middle', fill:'#8b98ab', 'font-size':10}); tx.textContent = t+'s'; }
+  for (const s of D.steps){
+    if (s.timing_type === 'TAP' || s.offset_ms == null) continue;
+    const x = X(s.t), y = Y(s.offset_ms), off = Math.abs(s.offset_ms) > 90, slight = s.is_error && !off;
+    const fill = off ? '#ef4444' : slight ? '#f59e0b' : FOOT[s.foot], r = off ? 5.5 : 4;
+    const p = s.foot === 'L'
+      ? el('circle', {cx:x, cy:y, r, fill, stroke: off ? FOOT.L : '#0b1018', 'stroke-width': off ? 2 : 1, class:'pt'})
+      : el('rect', {x:x-r, y:y-r, width:2*r, height:2*r, transform:`rotate(45 ${x} ${y})`, fill, stroke: off ? FOOT.R : '#0b1018', 'stroke-width': off ? 2 : 1, class:'pt'});
+    p.addEventListener('mousemove', ev => { tip.style.display = 'block'; tip.style.left = (ev.clientX + 12) + 'px'; tip.style.top = (ev.clientY - 34) + 'px';
+      tip.innerHTML = ''; const b = document.createElement('b'); b.style.color = FOOT[s.foot]; b.textContent = s.foot === 'L' ? 'Left foot' : 'Right foot'; tip.appendChild(b);
+      tip.appendChild(document.createTextNode(` · ${s.t.toFixed(2)} s · Beat ${s.beat ?? '–'} · ${sgn(s.offset_ms,0)} ms · ${s.status}`)); });
+    p.addEventListener('mouseleave', () => tip.style.display = 'none');
+    p.addEventListener('click', ev => { ev.stopPropagation(); seek(Math.max(0, s.t - 1.0), true); });
+  }
+  playhead = el('line', {x1:X(0), x2:X(0), y1:PT, y2:H-PB, stroke:'#ffc400', 'stroke-width':1.5});
 }
-function setDelta(ms){ delta = Math.max(-500, Math.min(500, ms)) / 1000; $('delta').value = Math.round(delta*1000);
-  refreshAdj(); refreshTable(); drawChart(); syncAudio(true); scheduled.clear(); }
-$('delta').addEventListener('input', e => setDelta(+e.target.value));
-$('dminus').onclick = () => setDelta(delta*1000 - 10); $('dplus').onclick = () => setDelta(delta*1000 + 10); $('dreset').onclick = () => setDelta(0);
+svg.addEventListener('click', ev => { if (!TL) return; const r = svg.getBoundingClientRect(), x = ev.clientX - r.left;
+  if (x >= TL.PL && x <= TL.W - TL.PR) seek((x - TL.PL) / (TL.W - TL.PL - TL.PR) * TL.t1); });
+new ResizeObserver(() => drawTimeline()).observe(svg);
+video.addEventListener('loadedmetadata', drawTimeline);
 
-// ---------- player sync ----------
-function musicTime(){ return video.currentTime - (D.mp3_offset_sec + delta); }
-function syncAudio(force){
+function renderAll(){ renderHeader(); renderScore(); renderTable(); drawTimeline(); $('offset').value = offset.toFixed(3); }
+
+// ======================= audio sync engine =======================
+// target_audio_time = video.currentTime - mp3_offset_sec. Enforced on play/pause/seeked/ratechange
+// and continuously in a requestAnimationFrame loop:
+//   |drift| > 40 ms  -> corrected; small drift by a gentle playbackRate trim (no audible seek),
+//   |drift| > 150 ms -> hard seek (rate-limited so we never seek every frame).
+const SYNC = {tol: 0.04, settleTol: 0.01, settleMs: 1500, hard: 0.15, lastSeek: 0, settleUntil: 0, stalled: false, drift: null};
+// Smooth video clock: video.currentTime only advances once per decoded frame (33 ms steps at 30 fps),
+// which would look like +/-33 ms of "drift". requestVideoFrameCallback gives the presented frame's
+// mediaTime + its display time, so we extrapolate between frames.
+const VC = {media: null, at: 0};
+function onVideoFrame(now, meta){ VC.media = meta.mediaTime; VC.at = meta.expectedDisplayTime || now; video.requestVideoFrameCallback(onVideoFrame); }
+if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) video.requestVideoFrameCallback(onVideoFrame);
+function videoClock(){
+  if (VC.media == null || video.paused || video.seeking) return video.currentTime;
+  const dt = (performance.now() - VC.at) / 1000 * video.playbackRate;
+  if (dt < 0 || dt > 0.25 || Math.abs(VC.media - video.currentTime) > 0.25) return video.currentTime;  // stale: fall back
+  return VC.media + dt;
+}
+video.addEventListener('seeked', () => { VC.media = null; });
+function musicOn(){ return audio && $('musicOn').checked; }
+function targetTime(){ return videoClock() - offset; }
+function inRange(t){ return t >= 0 && (!isFinite(audio.duration) || t < audio.duration); }
+function hardSync(){
   if (!audio) return;
-  const target = musicTime(), dur = audio.duration || Infinity;
-  if (video.paused || !$('musicOn').checked || target < 0 || target >= dur){
+  const t = targetTime();
+  audio.playbackRate = video.playbackRate;
+  if (!musicOn() || video.paused || video.seeking || SYNC.stalled || !inRange(t)){
     if (!audio.paused) audio.pause();
-    if (target >= 0 && target < dur && Math.abs(audio.currentTime - target) > 0.02) audio.currentTime = target;
+    if (inRange(t)) audio.currentTime = t;     // pre-position so the next play starts in sync
     return;
   }
-  audio.playbackRate = video.playbackRate;
-  if (force || Math.abs(audio.currentTime - target) > 0.06) audio.currentTime = target;
+  audio.currentTime = t; SYNC.lastSeek = performance.now(); SYNC.settleUntil = SYNC.lastSeek + SYNC.settleMs;
   if (audio.paused) audio.play().catch(() => {});
 }
-function seek(t){ video.currentTime = Math.max(0, t); scheduled.clear(); syncAudio(true); }
-['play','pause','seeked','ratechange'].forEach(ev => video.addEventListener(ev, () => { scheduled.clear(); syncAudio(true); }));
-setInterval(() => syncAudio(false), 250);
-$('musicOn').addEventListener('change', () => syncAudio(true));
+function syncTick(){
+  if (!audio) return;
+  if (!musicOn() || video.paused || video.seeking || SYNC.stalled){ if (!audio.paused) audio.pause(); SYNC.drift = null; return; }
+  const t = targetTime();
+  if (!inRange(t)){ if (!audio.paused) audio.pause(); SYNC.drift = null; return; }  // before song start / after its end
+  if (audio.paused || audio.seeking){ if (audio.paused && performance.now() - SYNC.lastSeek > 250) hardSync(); return; }
+  const drift = audio.currentTime - t; SYNC.drift = drift;
+  const now = performance.now();
+  if (Math.abs(drift) > SYNC.hard){
+    if (now - SYNC.lastSeek > 400){ audio.currentTime = t; SYNC.lastSeek = now; audio.playbackRate = video.playbackRate; }
+  } else if (Math.abs(drift) > (now < SYNC.settleUntil ? SYNC.settleTol : SYNC.tol)){
+    // steady state: re-sync above 40 ms; for 1.5 s after a (re)start also remove the play() start-up latency
+    const trim = Math.max(-0.08, Math.min(0.08, drift * 1.2));      // ahead -> slow down, behind -> speed up
+    audio.playbackRate = video.playbackRate * (1 - trim);
+  } else if (Math.abs(drift) < 0.01 && audio.playbackRate !== video.playbackRate){
+    audio.playbackRate = video.playbackRate;
+  }
+}
+['play','pause','seeked','ratechange'].forEach(ev => video.addEventListener(ev, () => { metro.clear(); hardSync(); updatePlayBtn(); }));
+video.addEventListener('seeking', () => { if (audio && !audio.paused) audio.pause(); });
+video.addEventListener('waiting', () => { SYNC.stalled = true; if (audio && !audio.paused) audio.pause(); });
+video.addEventListener('playing', () => { SYNC.stalled = false; hardSync(); });
+video.addEventListener('ended', () => { if (audio) audio.pause(); updatePlayBtn(); });
+$('musicOn').addEventListener('change', hardSync);
 $('camAudio').addEventListener('change', e => { video.muted = !e.target.checked; });
-document.querySelectorAll('[data-rate]').forEach(b => b.addEventListener('click', () => {
-  video.playbackRate = +b.dataset.rate; document.querySelectorAll('[data-rate]').forEach(x => x.classList.toggle('on', x === b));
-}));
 
-// ---------- metronome (Web Audio, beats 1 2 3 5 6 7) ----------
-let actx = null; const scheduled = new Set();
-$('metroOn').addEventListener('change', e => { if (e.target.checked && !actx) actx = new (window.AudioContext || window.webkitAudioContext)(); scheduled.clear(); });
+// ---------- transport ----------
+function updatePlayBtn(){ $('play').textContent = video.paused ? '▶' : '❚❚'; }
+$('play').onclick = () => { if (video.paused) video.play(); else video.pause(); };
+function seek(t, autoplay=false){ video.currentTime = Math.max(0, Math.min(t, (video.duration || t))); if (autoplay && video.paused) video.play(); }
+let scrubbing = false;
+$('scrub').addEventListener('input', e => { scrubbing = true; if (video.duration) seek(e.target.value / 1000 * video.duration); });
+$('scrub').addEventListener('change', () => { scrubbing = false; });
+document.querySelectorAll('[data-rate]').forEach(b => b.addEventListener('click', () => {
+  video.playbackRate = +b.dataset.rate; document.querySelectorAll('[data-rate]').forEach(x => x.classList.toggle('on', x === b)); }));
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.code === 'Space'){ e.preventDefault(); $('play').click(); }
+  if (e.code === 'ArrowLeft') seek(video.currentTime - (e.shiftKey ? 0.1 : 1));
+  if (e.code === 'ArrowRight') seek(video.currentTime + (e.shiftKey ? 0.1 : 1));
+});
+
+// ---------- offset calibration ----------
+let refetchTimer = null;
+function setOffset(v, {refetch=true} = {}){
+  if (!isFinite(v)) return;
+  offset = Math.round(v * 1000) / 1000; $('offset').value = offset.toFixed(3);
+  metro.clear(); hardSync();
+  if (refetch){ clearTimeout(refetchTimer); refetchTimer = setTimeout(async () => {
+    const r = await fetch('api/data?mp3_offset=' + encodeURIComponent(offset)); if (r.ok){ D = await r.json(); renderAll(); } }, 180); }
+}
+$('offset').addEventListener('change', e => setOffset(parseFloat(e.target.value)));
+document.querySelectorAll('[data-nudge]').forEach(b => b.addEventListener('click', () => setOffset(offset + (+b.dataset.nudge) / 1000)));
+$('reset').onclick = () => setOffset(ANALYZED);
+$('tap').onclick = () => {
+  // The current video moment should be a beat 1 of the song: snap the nearest song "1" (in mp3 time) onto it.
+  const tv = video.currentTime, m = tv - offset;
+  let ones = D.beats.filter(b => b.count === 1).map(b => b.t - D.mp3_offset_sec);
+  if (!ones.length) ones = D.beats.map(b => b.t - D.mp3_offset_sec);
+  if (!ones.length){ toast('No beat grid available for this song.'); return; }
+  let best = ones[0]; for (const b of ones) if (Math.abs(b - m) < Math.abs(best - m)) best = b;
+  setOffset(tv - best);
+  toast(`Beat 1 placed at ${tv.toFixed(3)} s → mp3_offset_sec = ${(tv - best).toFixed(3)} s (${sgn((tv - best - ANALYZED)*1000,0)} ms vs analysis)`);
+};
+$('save').onclick = async () => {
+  if (!D.media.can_save){ toast('Saving is disabled (read-only mode).'); return; }
+  const r = await fetch('api/save-offset', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mp3_offset_sec: offset})});
+  const j = await r.json().catch(() => ({}));
+  if (r.ok && j.ok) toast(`Saved mp3_offset_sec = ${j.mp3_offset_sec} s to ${j.config}. Re-run main.py for this session to re-score the steps and re-render the overlay.`, 8000);
+  else toast('Save failed: ' + (j.error || r.status));
+};
+
+// ---------- metronome (Web Audio, beats 1 2 3 5 6 7, follows the current offset) ----------
+let actx = null;
+const metro = {done: new Set(), clear(){ this.done.clear(); }};
+$('metroOn').addEventListener('change', e => { if (e.target.checked && !actx) actx = new (window.AudioContext || window.webkitAudioContext)(); metro.clear(); });
 function click(when, accent){
   const o = actx.createOscillator(), g = actx.createGain();
   o.frequency.value = accent ? 1760 : 1100; o.type = 'square';
@@ -762,29 +975,37 @@ function click(when, accent){
 }
 function metronomeTick(){
   if (!actx || !$('metroOn').checked || video.paused) return;
-  const vt = video.currentTime, rate = video.playbackRate || 1;
-  for (let k = 0; k < beats.length; k++){
-    const b = beats[k]; if (![1,2,3,5,6,7].includes(b.count)) continue;
-    const bt = b.t + delta; if (bt < vt - 0.01) continue; if (bt - vt > 0.15 * rate) break;
-    if (scheduled.has(k)) continue; scheduled.add(k);
+  const vt = video.currentTime, rate = video.playbackRate || 1, shift = offset - D.mp3_offset_sec;
+  for (let k = 0; k < D.beats.length; k++){
+    const b = D.beats[k]; if (![1,2,3,5,6,7].includes(b.count)) continue;
+    const bt = b.t + shift; if (bt < vt - 0.01) continue; if (bt - vt > 0.15 * rate) break;
+    if (metro.done.has(k)) continue; metro.done.add(k);
     click(actx.currentTime + Math.max(0, (bt - vt) / rate), b.count === 1);
   }
 }
 
-// ---------- animation loop ----------
-let lastCur = -1;
-function frame(){
-  const t = video.currentTime || 0;
-  if (playhead){ const x = Math.max(PL, Math.min(W-PR, X(t))); playhead.setAttribute('x1', x); playhead.setAttribute('x2', x); }
-  const c = countAt(t); const spans = $('beatbar').children;
-  for (let i = 0; i < 8; i++) spans[i].classList.toggle('cur', c === i+1);
-  let cur = -1; for (let i = 0; i < D.steps.length && D.steps[i].t <= t + 1e-3; i++) cur = i;
-  if (cur !== lastCur){ if (lastCur >= 0) rows[lastCur].classList.remove('cur');
-    if (cur >= 0){ rows[cur].classList.add('cur'); if (!video.paused) rows[cur].scrollIntoView({block:'nearest'}); } lastCur = cur; }
+// ======================= main loop =======================
+let lastCur = null, lastDriftUi = 0;
+function frame(now){
+  syncTick();
   metronomeTick();
+  const t = video.currentTime || 0, dur = video.duration || 0;
+  $('time').textContent = `${t.toFixed(2)} / ${dur.toFixed(2)} s`;
+  if (!scrubbing && dur) $('scrub').value = Math.round(t / dur * 1000);
+  if (playhead && TL){ const x = TL.X(Math.min(t, TL.t1)); playhead.setAttribute('x1', x); playhead.setAttribute('x2', x); }
+  if (now - lastDriftUi > 200){
+    lastDriftUi = now; const d = $('drift');
+    if (!audio) d.textContent = 'no song';
+    else if (SYNC.drift == null) d.textContent = (targetTime() < 0 && !video.paused) ? 'music starts in ' + (-targetTime()).toFixed(1) + ' s' : 'sync idle';
+    else { d.textContent = 'drift ' + sgn(SYNC.drift * 1000, 0) + ' ms'; d.classList.toggle('bad', Math.abs(SYNC.drift) > SYNC.tol); }
+  }
+  let cur = null; for (const [s, tr] of rows){ if (s.t <= t + 1e-3) cur = tr; else break; }
+  if (cur !== lastCur){ if (lastCur) lastCur.classList.remove('cur'); if (cur){ cur.classList.add('cur'); if (!video.paused) cur.scrollIntoView({block:'nearest'}); } lastCur = cur; }
   requestAnimationFrame(frame);
 }
-refreshAdj(); refreshTable(); drawChart(); requestAnimationFrame(frame);
+if (!D.media.video){ $('play').disabled = true; toast('Video not available.'); }
+window.__dash = {get offset(){ return offset; }, sync: SYNC, video, audio, setOffset, videoClock, get data(){ return D; }};
+renderAll(); updatePlayBtn(); requestAnimationFrame(frame);
 })();
 </script>
 </body>

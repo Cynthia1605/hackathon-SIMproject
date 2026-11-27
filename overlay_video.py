@@ -1,13 +1,21 @@
-"""Render the MediaPipe skeleton plus a live rhythm HUD onto cam1.mp4.
+"""Render the skeleton, foot-specific timing callouts and an 8-count strip onto cam1.mp4.
 
     python overlay_video.py --config sessions.json --subject subject_01 [--max-seconds 20]
 
-Output: ``outputs/<subject_id>/overlay_cam1.mp4``. The overlay is first written with
-OpenCV (``avc1``, falling back to ``mp4v``). When ffmpeg is available (on PATH or
-bundled with imageio-ffmpeg), it is then re-encoded to browser-friendly H.264
-(yuv420p, faststart) and the original cam1 audio is muxed back in.
+Output: ``outputs/<subject_id>/overlay_cam1.mp4``.
 
-HUD text is ASCII only: OpenCV's Hershey fonts cannot draw accented characters.
+Visual hierarchy:
+* Upper body: thin, semi-transparent (alpha 0.35) muted slate-cyan lines.
+* Legs, ankles, heels and toes: crisp electric cyan (#00E5FF, left) and magenta-coral
+  (#FF4081, right) with glowing joint rings.
+* Each footfall: for ~0.6 s, a ring around that foot plus a floating tag beside it.
+  The tag reads e.g. "LEFT FOOT • BEAT 3" over a badge: ON TIME (+12ms) in green,
+  EARLY / LATE (45-90 ms) in amber, EARLY / LATE / OFF-BEAT (>90 ms) in red.
+* Bottom strip: an 8-count ``1 2 3 [4] 5 6 7 [8]`` that lights the active beat with a
+  progress fill and flashes red on a beat where a timing error happened.
+
+The video is written with OpenCV, then re-encoded to browser-friendly H.264 with the
+original audio when ffmpeg is available (on PATH or bundled with imageio-ffmpeg).
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -37,37 +46,86 @@ POSE_CONNECTIONS = [
     (27, 29), (28, 30), (29, 31), (30, 32), (27, 31), (28, 32),
 ]
 LOWER_BODY = set(range(23, 33))
+LEFT_LEG = {23, 25, 27, 29, 31}
+RIGHT_LEG = {24, 26, 28, 30, 32}
+LEG_JOINTS = {25, 26, 27, 28, 29, 30, 31, 32}
+FOOT = {"L": [L.LEFT_ANKLE, L.LEFT_HEEL, L.LEFT_FOOT_INDEX], "R": [L.RIGHT_ANKLE, L.RIGHT_HEEL, L.RIGHT_FOOT_INDEX]}
 
-# BGR colours
-NEON_LEFT = (255, 255, 0)  # cyan
-NEON_RIGHT = (255, 0, 255)  # magenta
-NEON_HIPS = (0, 255, 255)  # yellow
-UPPER = (235, 235, 235)
-GREEN = (80, 200, 60)
-YELLOW = (0, 210, 255)
-RED = (60, 60, 230)
-GREY = (140, 140, 140)
+
+def hex_bgr(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    return int(h[4:6], 16), int(h[2:4], 16), int(h[0:2], 16)
+
+
+# Palette (BGR)
+LEFT_COL = hex_bgr("#00E5FF")  # electric cyan
+RIGHT_COL = hex_bgr("#FF4081")  # magenta-coral
+HIP_COL = hex_bgr("#E8EEF5")
+UPPER_COL = hex_bgr("#78AABE")  # muted slate-cyan
+GREEN = hex_bgr("#22C55E")
+AMBER = hex_bgr("#F59E0B")
+RED = hex_bgr("#EF4444")
+GREY = hex_bgr("#64748B")
+BEAT_ON = hex_bgr("#FFC400")
+DARK = hex_bgr("#0B1220")
+WHITE = (255, 255, 255)
+FOOT_COL = {"L": LEFT_COL, "R": RIGHT_COL}
 
 ON_TIME_MS = 45.0
 SLIGHT_MS = 90.0
+CALLOUT_S = 0.6
+UPPER_ALPHA = 0.35
 
 
 # --------------------------------------------------------------------------- #
-# Pure rhythm-state logic (shared with dashboard.py)
+# Timing classification (shared with dashboard.py)
 # --------------------------------------------------------------------------- #
 def classify_offset(offset_ms: float | None) -> tuple[str, str]:
-    """Return (category, Spanish ASCII label) for a step's beat offset."""
+    """Return (category, label) for a step's beat offset.
+
+    Categories are on_time, early, late, off_early, off_late, or none.
+    """
     if offset_ms is None or not np.isfinite(offset_ms):
-        return "none", "SIN REFERENCIA"
+        return "none", "NO BEAT REF"
     a = abs(offset_ms)
     if a <= ON_TIME_MS:
-        return "on_time", "A TIEMPO"
+        return "on_time", "ON TIME"
     if a <= SLIGHT_MS:
-        return "slight", "LEVEMENTE ADELANTADO" if offset_ms < 0 else "LEVEMENTE ATRASADO"
-    return "off", "FUERA DE TEMPO"
+        return ("early", "EARLY") if offset_ms < 0 else ("late", "LATE")
+    return ("off_early", "EARLY / OFF-BEAT") if offset_ms < 0 else ("off_late", "LATE / OFF-BEAT")
 
 
-CATEGORY_BGR = {"on_time": GREEN, "slight": YELLOW, "off": RED, "none": GREY}
+CATEGORY_BGR = {"on_time": GREEN, "early": AMBER, "late": AMBER, "off_early": RED, "off_late": RED, "none": GREY}
+
+
+def is_error(offset_ms: float | None) -> bool:
+    return offset_ms is not None and np.isfinite(offset_ms) and abs(offset_ms) > ON_TIME_MS
+
+
+def offset_badge(offset_ms: float | None) -> str:
+    cat, label = classify_offset(offset_ms)
+    return label if cat == "none" else f"{label} ({offset_ms:+.0f}ms)"
+
+
+def analysis_beat_grid(report: dict[str, Any]) -> np.ndarray:
+    """The beat grid the steps were scored against (cam1 timeline).
+
+    Uses ``beat_grid_sec`` if main.py exported it. For older reports, it rebuilds the
+    tempo-octave correction from salsa_rhythm: if the song's beat period is about 2x
+    the analysis beat period (half-time beat tracking), midpoints are inserted. The
+    raw librosa grid must not be used in that case, or the 8-count runs at half speed.
+    """
+    g = report.get("beat_grid_sec")
+    if g:
+        return np.asarray(g, dtype=np.float64)
+    music = report.get("music", {}) or {}
+    grid = np.asarray(music.get("aligned_beat_times_sec") or [], dtype=np.float64)
+    period = (report.get("summary", {}) or {}).get("beat_period_sec")
+    if len(grid) >= 2 and period:
+        ratio = float(np.median(np.diff(grid))) / float(period)
+        if 1.7 < ratio < 2.3:
+            grid = np.sort(np.concatenate([grid, 0.5 * (grid[:-1] + grid[1:])]))
+    return grid
 
 
 def _count_phase(grid: np.ndarray, steps: list[dict]) -> int | None:
@@ -86,7 +144,7 @@ def _count_phase(grid: np.ndarray, steps: list[dict]) -> int | None:
 
 @dataclass
 class RhythmTimeline:
-    """Everything needed to answer 'what is the rhythm state at cam1 time t'."""
+    """Answers 'what is the rhythm state at cam1 time t'."""
 
     epochs: list[tuple[float, float]]
     steps: list[dict]  # sorted by timestamp_sec, TAPs included
@@ -99,7 +157,7 @@ class RhythmTimeline:
     @classmethod
     def from_report(cls, report: dict[str, Any]) -> "RhythmTimeline":
         music = report.get("music", {}) or {}
-        grid = np.asarray(music.get("aligned_beat_times_sec") or [], dtype=np.float64)
+        grid = analysis_beat_grid(report)
         steps = sorted(report.get("steps", []), key=lambda s: s["timestamp_sec"])
         period = (report.get("summary", {}) or {}).get("beat_period_sec") or music.get("beat_period_sec") or 0.5
         epochs = [(float(e["start_sec"]), float(e["end_sec"])) for e in report.get("epochs", [])]
@@ -115,12 +173,18 @@ class RhythmTimeline:
                 return i
         return None
 
-    def beat_count_at(self, t: float) -> int | None:
+    def _beat_index(self, t: float) -> int | None:
         g = self.beat_grid
         if len(g) == 0:
             return None
         k = int(np.searchsorted(g, t, side="right")) - 1
         if k < 0 or t - g[k] > 1.5 * self.beat_period:
+            return None
+        return k
+
+    def beat_count_at(self, t: float) -> int | None:
+        k = self._beat_index(t)
+        if k is None:
             return None
         ep = self.epoch_at(t)
         phase = self.phase_by_epoch.get(ep) if ep is not None else None
@@ -130,11 +194,27 @@ class RhythmTimeline:
             return None
         return (k - phase) % 8 + 1
 
+    def beat_progress_at(self, t: float) -> float:
+        """Fraction (0-1) of the current beat that has elapsed."""
+        k = self._beat_index(t)
+        if k is None:
+            return 0.0
+        g = self.beat_grid
+        nxt = g[k + 1] if k + 1 < len(g) else g[k] + self.beat_period
+        return float(np.clip((t - g[k]) / max(1e-6, nxt - g[k]), 0.0, 1.0))
+
     def beats_with_counts(self) -> list[dict[str, Any]]:
+        return [{"t": float(bt), "count": self.beat_count_at(float(bt) + 1e-6)} for bt in self.beat_grid]
+
+    def recent_steps(self, t: float, window_s: float = CALLOUT_S) -> list[tuple[dict, float]]:
+        """Steps whose footfall happened in (t - window, t], with their age in seconds."""
         out = []
-        for k, bt in enumerate(self.beat_grid):
-            c = self.beat_count_at(float(bt) + 1e-6)
-            out.append({"t": float(bt), "count": c})
+        for s in self.steps:
+            age = t - s["timestamp_sec"]
+            if age < 0:
+                break
+            if age <= window_s:
+                out.append((s, age))
         return out
 
     def last_step(self, t: float, max_age_s: float = 2.5) -> dict | None:
@@ -148,148 +228,352 @@ class RhythmTimeline:
             return None
         return last
 
+    def on_time_so_far(self, t: float) -> tuple[int, int]:
+        n = ok = 0
+        for s in self.steps:
+            if s["timestamp_sec"] > t:
+                break
+            off = s.get("beat_offset_ms")
+            if s.get("timing_type") == "TAP" or off is None:
+                continue
+            n += 1
+            ok += abs(off) <= ON_TIME_MS
+        return ok, n
+
     def state_at(self, t: float) -> dict[str, Any]:
         ep = self.epoch_at(t)
         step = self.last_step(t)
         count = self.beat_count_at(t)
         if count is None and step is not None and step.get("beat_count"):
             count = int(step["beat_count"])
-        cat, label = classify_offset(step.get("beat_offset_ms") if step else None)
+        callouts = []
+        flashes: dict[int, float] = {}
+        for s, age in self.recent_steps(t):
+            if s.get("timing_type") == "TAP":
+                continue
+            cat, label = classify_offset(s.get("beat_offset_ms"))
+            callouts.append({
+                "foot": s.get("foot"),
+                "foot_label": "LEFT FOOT" if s.get("foot") == "L" else "RIGHT FOOT",
+                "beat": s.get("beat_count"),
+                "offset_ms": s.get("beat_offset_ms"),
+                "category": cat,
+                "badge": offset_badge(s.get("beat_offset_ms")),
+                "is_error": is_error(s.get("beat_offset_ms")),
+                "age": age,
+            })
+            if is_error(s.get("beat_offset_ms")) and s.get("beat_count"):
+                b = int(s["beat_count"])
+                flashes[b] = min(age, flashes.get(b, age))
+        ok, n = self.on_time_so_far(t)
+        last_cat, last_label = classify_offset(step.get("beat_offset_ms") if step else None)
         return {
             "t": t,
             "active": ep is not None,
-            "status": "BAILANDO / ACTIVO" if ep is not None else "EN PAUSA / IDLE",
+            "status": "DANCING" if ep is not None else "IDLE",
             "count": count,
+            "beat_progress": self.beat_progress_at(t),
+            "callouts": callouts,
+            "error_flash": flashes,  # beat count -> age of the error (s)
             "last_step": step,
-            "feedback_category": cat if step else None,
-            "feedback_label": label if step else None,
-            "step_flash": step is not None and t - step["timestamp_sec"] <= 0.2,
+            "last_category": last_cat if step else None,
+            "last_label": last_label if step else None,
+            "on_time": (ok, n),
+            "bpm": self.bpm,
         }
 
 
 # --------------------------------------------------------------------------- #
-# Drawing
+# Text rendering (anti-aliased TrueType via Pillow, cached patches; Hershey fallback)
 # --------------------------------------------------------------------------- #
-def _side_colour(j: int) -> tuple[int, int, int]:
-    if j in (23, 24):
-        return NEON_HIPS
-    return NEON_LEFT if j % 2 == 1 else NEON_RIGHT
+def _font_path() -> str | None:
+    try:
+        import matplotlib
+
+        p = Path(matplotlib.__file__).parent / "mpl-data" / "fonts" / "ttf" / "DejaVuSans-Bold.ttf"
+        return str(p) if p.is_file() else None
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=4096)
+def _text_patch(text: str, px: int, fg: tuple, bg: tuple | None, pad: int, radius: int):
+    """BGR patch + alpha mask for a (optionally pill-shaped) text label."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    font = ImageFont.truetype(_font_path(), px)
+    x0, y0, x1, y1 = font.getbbox(text)
+    w, h = x1 - x0 + 2 * pad, (font.getbbox("Ag")[3] - font.getbbox("Ag")[1]) + 2 * pad
+    img = Image.new("RGBA", (max(1, w), max(1, h)), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    if bg is not None:
+        b, g, r = bg[:3]
+        a = bg[3] if len(bg) == 4 else 255
+        d.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=(r, g, b, a))
+    d.text((pad - x0, pad - font.getbbox("Ag")[1]), text, font=font, fill=(fg[2], fg[1], fg[0], 255))
+    arr = np.asarray(img).astype(np.float32)
+    return arr[..., [2, 1, 0]], arr[..., 3:4] / 255.0
+
+
+def put_label(frame: np.ndarray, text: str, x: int, y: int, px: int, fg=WHITE, bg=None, pad: int = 0,
+              radius: int = 0, alpha: float = 1.0, anchor: str = "lt") -> tuple[int, int, int, int]:
+    """Draw a label; anchor is 'lt' | 'rt' | 'ct' | 'lb' | 'cb'. Returns its (x, y, w, h)."""
+    px = max(8, int(px))
+    if _font_path() is not None:
+        try:
+            patch, a = _text_patch(text, px, tuple(fg), tuple(bg) if bg is not None else None, int(pad), int(radius))
+        except Exception:
+            patch = None
+    else:
+        patch = None
+    if patch is None:  # Hershey fallback (ASCII only)
+        import cv2
+
+        sc = px / 30.0
+        t = text.replace("•", "-")
+        (tw, th), base = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, sc, 2)
+        w, h = tw + 2 * pad, th + base + 2 * pad
+        x, y = _anchor(x, y, w, h, anchor)
+        if bg is not None:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), tuple(int(c) for c in bg[:3]), -1)
+        cv2.putText(frame, t, (x + pad, y + pad + th), cv2.FONT_HERSHEY_SIMPLEX, sc, tuple(fg), 2, cv2.LINE_AA)
+        return x, y, w, h
+    h, w = patch.shape[:2]
+    x, y = _anchor(x, y, w, h, anchor)
+    H, W = frame.shape[:2]
+    xa, ya, xb, yb = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
+    if xb <= xa or yb <= ya:
+        return x, y, w, h
+    p = patch[ya - y : yb - y, xa - x : xb - x]
+    m = a[ya - y : yb - y, xa - x : xb - x] * float(alpha)
+    roi = frame[ya:yb, xa:xb].astype(np.float32)
+    frame[ya:yb, xa:xb] = (roi * (1 - m) + p * m).astype(np.uint8)
+    return x, y, w, h
+
+
+def _anchor(x, y, w, h, anchor):
+    if anchor[0] == "r":
+        x -= w
+    elif anchor[0] == "c":
+        x -= w // 2
+    if anchor[1] == "b":
+        y -= h
+    return int(x), int(y)
+
+
+def _blend_rect(frame, x0, y0, x1, y1, colour, alpha):
+    import cv2
+
+    H, W = frame.shape[:2]
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = frame[y0:y1, x0:x1]
+    col = np.empty_like(roi)
+    col[:] = colour
+    cv2.addWeighted(col, alpha, roi, 1 - alpha, 0, dst=roi)
+
+
+# --------------------------------------------------------------------------- #
+# Skeleton
+# --------------------------------------------------------------------------- #
+def _leg_colour(a: int, b: int) -> tuple[int, int, int]:
+    if {a, b} == {23, 24}:
+        return HIP_COL
+    return LEFT_COL if b in LEFT_LEG else RIGHT_COL
+
+
+def _bbox(pts: np.ndarray, ok: np.ndarray, pad: int, W: int, H: int):
+    if not ok.any():
+        return None
+    p = pts[ok]
+    x0, y0 = np.maximum(p.min(axis=0) - pad, 0).astype(int)
+    x1, y1 = np.minimum(p.max(axis=0) + pad, [W, H]).astype(int)
+    return (x0, y0, x1, y1) if x1 > x0 and y1 > y0 else None
 
 
 def draw_skeleton(frame: np.ndarray, kp: np.ndarray, vis_min: float = 0.5, scale: float = 1.0) -> np.ndarray:
-    """Draw the 33-landmark skeleton in place. ``kp`` is (33, 3) [x_px, y_px, visibility]."""
+    """Draw the skeleton in place: faint upper body, crisp glowing legs/feet."""
     import cv2
 
+    H, W = frame.shape[:2]
     ok = np.isfinite(kp[:, 0]) & np.isfinite(kp[:, 1]) & (kp[:, 2] >= vis_min)
-    pts = np.nan_to_num(kp[:, :2]).astype(int)
-    thin, thick = max(1, int(2 * scale)), max(2, int(6 * scale))
+    pts = np.nan_to_num(kp[:, :2]).astype(np.int32)
+    s = scale
+    box = _bbox(pts.astype(float), ok, int(60 * s), W, H)
+    if box is None:
+        return frame
+    x0, y0, x1, y1 = box
+    off = np.array([x0, y0])
+    roi = frame[y0:y1, x0:x1]
+    P = lambda j: tuple(int(v) for v in pts[j] - off)  # noqa: E731
+
+    # 1) upper body: thin, alpha 0.35
+    upper = roi.copy()
     for a, b in POSE_CONNECTIONS:
-        if not (ok[a] and ok[b]):
-            continue
-        lower = a in LOWER_BODY and b in LOWER_BODY
-        if lower:
-            col = NEON_HIPS if {a, b} == {23, 24} else _side_colour(b)
-            cv2.line(frame, tuple(pts[a]), tuple(pts[b]), (0, 0, 0), thick + 4, cv2.LINE_AA)
-            cv2.line(frame, tuple(pts[a]), tuple(pts[b]), col, thick, cv2.LINE_AA)
-        else:
-            cv2.line(frame, tuple(pts[a]), tuple(pts[b]), (30, 30, 30), thin + 2, cv2.LINE_AA)
-            cv2.line(frame, tuple(pts[a]), tuple(pts[b]), UPPER, thin, cv2.LINE_AA)
-    for j in range(len(kp)):
+        if ok[a] and ok[b] and not (a in LOWER_BODY and b in LOWER_BODY):
+            cv2.line(upper, P(a), P(b), UPPER_COL, max(1, int(round(2 * s))), cv2.LINE_AA)
+    for j in range(0, 23):
+        if ok[j] and j >= 11:
+            cv2.circle(upper, P(j), max(2, int(3 * s)), UPPER_COL, -1, cv2.LINE_AA)
+    cv2.addWeighted(upper, UPPER_ALPHA, roi, 1 - UPPER_ALPHA, 0, dst=roi)
+
+    # 2) leg glow (wide, soft)
+    glow = roi.copy()
+    for a, b in POSE_CONNECTIONS:
+        if ok[a] and ok[b] and a in LOWER_BODY and b in LOWER_BODY and {a, b} != {23, 24}:
+            cv2.line(glow, P(a), P(b), _leg_colour(a, b), max(6, int(16 * s)), cv2.LINE_AA)
+    for j in LEG_JOINTS:
+        if ok[j]:
+            cv2.circle(glow, P(j), max(6, int(15 * s)), LEFT_COL if j in LEFT_LEG else RIGHT_COL, -1, cv2.LINE_AA)
+    glow = cv2.GaussianBlur(glow, (0, 0), max(1.0, 4 * s))
+    cv2.addWeighted(glow, 0.35, roi, 0.65, 0, dst=roi)
+
+    # 3) crisp legs with dark outline
+    for a, b in POSE_CONNECTIONS:
+        if ok[a] and ok[b] and a in LOWER_BODY and b in LOWER_BODY:
+            th = max(2, int(round(5 * s)))
+            cv2.line(roi, P(a), P(b), (15, 15, 15), th + max(2, int(3 * s)), cv2.LINE_AA)
+            cv2.line(roi, P(a), P(b), _leg_colour(a, b), th, cv2.LINE_AA)
+    # 4) joint rings
+    for j in sorted(LOWER_BODY):
         if not ok[j]:
             continue
-        if j in LOWER_BODY:
-            r = max(4, int(9 * scale))
-            cv2.circle(frame, tuple(pts[j]), r + 2, (0, 0, 0), -1, cv2.LINE_AA)
-            cv2.circle(frame, tuple(pts[j]), r, _side_colour(j), -1, cv2.LINE_AA)
-        else:
-            cv2.circle(frame, tuple(pts[j]), max(2, int(3 * scale)), UPPER, -1, cv2.LINE_AA)
+        col = HIP_COL if j in (23, 24) else (LEFT_COL if j in LEFT_LEG else RIGHT_COL)
+        r = max(4, int((8 if j in (27, 28, 29, 30, 31, 32) else 7) * s))
+        cv2.circle(roi, P(j), r + max(1, int(2 * s)), (15, 15, 15), -1, cv2.LINE_AA)
+        cv2.circle(roi, P(j), r, col, max(2, int(round(2.5 * s))), cv2.LINE_AA)
+        cv2.circle(roi, P(j), max(1, r // 3), col, -1, cv2.LINE_AA)
     return frame
 
 
-def _text(frame, s, org, scale, colour, thick=2):
+def foot_center(kp: np.ndarray, foot: str, vis_min: float = 0.3) -> np.ndarray | None:
+    idx = FOOT[foot]
+    p = kp[idx]
+    m = np.isfinite(p[:, 0]) & np.isfinite(p[:, 1]) & (p[:, 2] >= vis_min)
+    if not m.any():
+        return None
+    return p[m, :2].mean(axis=0)
+
+
+# --------------------------------------------------------------------------- #
+# HUD pieces
+# --------------------------------------------------------------------------- #
+def draw_callouts(frame: np.ndarray, state: dict[str, Any], kp: np.ndarray | None) -> list[dict]:
+    """Ring + floating tag beside each foot that stepped in the last ~0.6 s. Returns drawn boxes."""
     import cv2
 
-    cv2.putText(frame, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick + 3, cv2.LINE_AA)
-    cv2.putText(frame, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, colour, thick, cv2.LINE_AA)
+    if kp is None:
+        return []
+    H, W = frame.shape[:2]
+    s = H / 720.0
+    hips = kp[[L.LEFT_HIP, L.RIGHT_HIP]]
+    hip_ok = np.isfinite(hips[:, 0]).all()
+    body_x = float(np.mean(hips[:, 0])) if hip_ok else W / 2
+    drawn = []
+    for c in state.get("callouts", []):
+        ctr = foot_center(kp, c["foot"])
+        if ctr is None:
+            continue
+        age = c["age"]
+        fade = 1.0 if age < CALLOUT_S * 0.7 else max(0.0, (CALLOUT_S - age) / (CALLOUT_S * 0.3))
+        if fade <= 0:
+            continue
+        col = CATEGORY_BGR[c["category"]]
+        err = c["is_error"]
+        cx, cy = int(ctr[0]), int(ctr[1])
+        pulse = 1.0 + 0.35 * max(0.0, 1.0 - age / 0.25)
+        r = int((34 if err else 26) * s * pulse)
+        layer = frame.copy()
+        cv2.circle(layer, (cx, cy), r, col, max(2, int((5 if err else 3) * s)), cv2.LINE_AA)
+        if err:
+            cv2.circle(layer, (cx, cy), r + int(7 * s), col, max(1, int(2 * s)), cv2.LINE_AA)
+        # tag placement: outside of the body, above the foot
+        side = -1 if ctr[0] < body_x else 1
+        tx = cx + side * (r + int(18 * s))
+        ty = cy - int(74 * s)
+        lead_end = (tx, ty + int(52 * s))
+        cv2.line(layer, (cx + side * int(r * 0.7), cy - int(r * 0.7)), lead_end, col, max(1, int(2 * s)), cv2.LINE_AA)
+        cv2.addWeighted(layer, fade, frame, 1 - fade, 0, dst=frame)
+        anchor = "rt" if side < 0 else "lt"
+        beat = f" • BEAT {c['beat']}" if c.get("beat") else ""
+        hx, hy, hw, hh = put_label(frame, f"{c['foot_label']}{beat}", tx, ty, int(17 * s), WHITE,
+                                   (*DARK, 215), pad=int(7 * s), radius=int(8 * s), alpha=fade, anchor=anchor)
+        fg = DARK if c["category"] in ("on_time", "early", "late") else WHITE
+        bx, by, bw, bh = put_label(frame, c["badge"], tx, hy + hh + int(4 * s), int(17 * s), fg, (*col, 245),
+                                   pad=int(7 * s), radius=int(8 * s), alpha=fade, anchor=anchor)
+        drawn.append({"foot": c["foot"], "center": (cx, cy), "ring_r": r, "tag": (hx, hy, hw, hh + bh + int(4 * s)),
+                      "category": c["category"]})
+    return drawn
 
 
-def _badge(frame, s, x, y, scale, bg, fg=(255, 255, 255), thick=2):
-    import cv2
-
-    (tw, th), base = cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
-    pad = int(8 * scale / 0.7)
-    cv2.rectangle(frame, (x, y), (x + tw + 2 * pad, y + th + base + 2 * pad), bg, -1)
-    cv2.putText(frame, s, (x + pad, y + pad + th), cv2.FONT_HERSHEY_SIMPLEX, scale, fg, thick, cv2.LINE_AA)
-    return y + th + base + 2 * pad
-
-
-def draw_hud(frame: np.ndarray, state: dict[str, Any], kp: np.ndarray | None = None,
-             footer: str = "") -> np.ndarray:
-    """Translucent rhythm HUD in the top-left corner, drawn in place."""
-    import cv2
-
-    h, w = frame.shape[:2]
-    s = h / 720.0
-    fs = 0.75 * s
-    th = max(1, int(round(2 * s)))
-    x0, y0 = int(16 * s), int(16 * s)
-    pw, ph = int(min(w - 2 * x0, 560 * s)), int(230 * s)
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + pw, y0 + ph), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, dst=frame)
-
-    x, y = x0 + int(12 * s), y0 + int(12 * s)
-    y = _badge(frame, state["status"], x, y, fs, GREEN if state["active"] else GREY, thick=th) + int(10 * s)
-
-    # 8-count row: 1 - 2 - 3 - (4) - 5 - 6 - 7 - (8)
-    tokens = ["1", "2", "3", "(4)", "5", "6", "7", "(8)"]
+def draw_beat_strip(frame: np.ndarray, state: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Bottom 8-count strip. Returns the strip box (x, y, w, h)."""
+    H, W = frame.shape[:2]
+    s = H / 720.0
+    margin = int(16 * s)
+    sh = int(54 * s)
+    x0, y0 = margin, H - margin - sh
+    sw = W - 2 * margin
+    _blend_rect(frame, x0, y0, x0 + sw, y0 + sh, DARK, 0.62)
+    put_label(frame, "COUNT", x0 + int(12 * s), y0 + sh // 2 - int(8 * s), int(13 * s), (170, 180, 190))
+    cells_x0 = x0 + int(84 * s)
+    gap = int(6 * s)
+    cw = (x0 + sw - int(10 * s) - cells_x0 - 7 * gap) // 8
     cur = state.get("count")
-    cx = x
-    base_y = y + int(30 * s)
-    for i, tok in enumerate(tokens):
+    active = state.get("active")
+    flashes = state.get("error_flash", {})
+    for i in range(8):
         n = i + 1
-        is_hold = n in (4, 8)
-        big = 1.0 * s
-        (tw, tht), _ = cv2.getTextSize(tok, cv2.FONT_HERSHEY_SIMPLEX, big, th + 1)
+        hold = n in (4, 8)
+        cx0 = cells_x0 + i * (cw + gap)
+        cy0, cy1 = y0 + int(8 * s), y0 + sh - int(8 * s)
+        base_alpha = 0.55 if active else 0.35
+        _blend_rect(frame, cx0, cy0, cx0 + cw, cy1, hex_bgr("#1F2937"), base_alpha)
+        flash = 0.92 * max(0.0, 1.0 - flashes[n] / CALLOUT_S) if n in flashes else 0.0
         if cur == n:
-            cv2.rectangle(frame, (cx - int(5 * s), base_y - tht - int(7 * s)),
-                          (cx + tw + int(5 * s), base_y + int(7 * s)),
-                          (0, 200, 255) if not is_hold else (120, 120, 120), -1)
-            col = (0, 0, 0)
+            _blend_rect(frame, cx0, cy0, cx0 + cw, cy1, BEAT_ON if not hold else hex_bgr("#94A3B8"),
+                        0.92 if active else 0.45)
+            prog = state.get("beat_progress", 0.0)
+            _blend_rect(frame, cx0, cy1 - int(4 * s), cx0 + int(cw * prog), cy1, DARK, 0.8)
+            fg = DARK
         else:
-            col = (110, 110, 110) if is_hold else ((235, 235, 235) if state["active"] else (150, 150, 150))
-        cv2.putText(frame, tok, (cx, base_y), cv2.FONT_HERSHEY_SIMPLEX, big, col, th + 1, cv2.LINE_AA)
-        cx += tw + int(8 * s)
-        if i < len(tokens) - 1:
-            cv2.putText(frame, "-", (cx, base_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * s, (120, 120, 120), th,
-                        cv2.LINE_AA)
-            cx += int(18 * s)
-    y = base_y + int(18 * s)
+            fg = (110, 118, 128) if hold else ((240, 240, 240) if active else (150, 155, 160))
+        if flash > 0:  # a timing error on this beat: red wins over the active highlight
+            _blend_rect(frame, cx0, cy0, cx0 + cw, cy1, RED, flash)
+            fg = WHITE
+        label = f"[{n}]" if hold else str(n)
+        put_label(frame, label, cx0 + cw // 2, (cy0 + cy1) // 2 - int(11 * s), int(20 * s), fg, anchor="ct")
+    return x0, y0, sw, sh
 
-    step = state.get("last_step")
-    if step is not None:
-        cat = state["feedback_category"]
-        y = _badge(frame, state["feedback_label"], x, y, fs, CATEGORY_BGR[cat], thick=th) + int(6 * s)
-        off = step.get("beat_offset_ms")
-        detail = f"Ultimo paso {step.get('label', '')}"
-        if off is not None:
-            detail += f"  {off:+.0f} ms"
-        _text(frame, detail, (x, y + int(22 * s)), 0.62 * s, (235, 235, 235), th)
-        y += int(30 * s)
-    else:
-        _text(frame, "Ultimo paso: -", (x, y + int(22 * s)), 0.62 * s, (170, 170, 170), th)
-        y += int(30 * s)
+
+def draw_status(frame: np.ndarray, state: dict[str, Any], footer: str = "") -> None:
+    H, W = frame.shape[:2]
+    s = H / 720.0
+    x, y = int(16 * s), int(16 * s)
+    act = state["active"]
+    _, _, w1, h1 = put_label(frame, ("● " if act else "") + state["status"], x, y, int(17 * s),
+                             DARK if act else WHITE, (*(GREEN if act else GREY), 240), pad=int(8 * s), radius=int(9 * s))
+    xx = x + w1 + int(8 * s)
+    if state.get("bpm"):
+        _, _, w2, _ = put_label(frame, f"{state['bpm']:.0f} BPM", xx, y, int(17 * s), WHITE, (*DARK, 200),
+                                pad=int(8 * s), radius=int(9 * s))
+        xx += w2 + int(8 * s)
+    ok, n = state.get("on_time", (0, 0))
+    if n:
+        pct = 100.0 * ok / n
+        col = GREEN if pct >= 70 else AMBER if pct >= 45 else RED
+        put_label(frame, f"ON TIME {pct:.0f}%  ({ok}/{n})", xx, y, int(17 * s), col, (*DARK, 210),
+                  pad=int(8 * s), radius=int(9 * s))
     if footer:
-        _text(frame, footer, (x, y0 + ph - int(10 * s)), 0.5 * s, (200, 200, 200), max(1, th - 1))
+        put_label(frame, footer, x, y + h1 + int(6 * s), int(12 * s), (200, 205, 210), (*DARK, 150),
+                  pad=int(5 * s), radius=int(6 * s))
 
-    # footfall flash ring on the stepping foot
-    if kp is not None and step is not None and state.get("step_flash"):
-        j = L.LEFT_ANKLE if step.get("foot") == "L" else L.RIGHT_ANKLE
-        if np.isfinite(kp[j, :2]).all():
-            c = tuple(int(v) for v in kp[j, :2])
-            cv2.circle(frame, c, int(28 * s), CATEGORY_BGR[state["feedback_category"]], max(2, int(4 * s)),
-                       cv2.LINE_AA)
+
+def draw_hud(frame: np.ndarray, state: dict[str, Any], kp: np.ndarray | None = None, footer: str = "") -> np.ndarray:
+    draw_status(frame, state, footer)
+    draw_callouts(frame, state, kp)
+    draw_beat_strip(frame, state)
     return frame
 
 
@@ -337,7 +621,7 @@ def finalize_with_ffmpeg(raw: Path, source_video: Path | None, out: Path, ffmpeg
     cmd = [ffmpeg, "-y", "-v", "error", "-i", str(raw)]
     if source_video is not None and Path(source_video).is_file():
         cmd += ["-i", str(source_video), "-map", "0:v:0", "-map", "1:a:0?", "-c:a", "aac", "-b:a", "160k"]
-    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "22",
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "21",
             "-movflags", "+faststart", "-shortest", str(out)]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
@@ -382,8 +666,7 @@ def render_overlay(
 
     sync_txt = ""
     if sync_info:
-        sync_txt = f"sync {sync_info.get('method', '?')} {int(sync_info.get('frame_offset', 0)):+d}f"
-    bpm_txt = f"BPM {timeline.bpm:.0f}" if timeline.bpm else "BPM -"
+        sync_txt = f"sync: {sync_info.get('method', '?')} {int(sync_info.get('frame_offset', 0)):+d} frames"
     max_frames = int(max_seconds * fps) if max_seconds else None
     warnings: list[str] = []
     if abs(fps - seq.fps) > 0.01 * fps:
@@ -398,7 +681,7 @@ def render_overlay(
                 break
             t = i / fps
             kp = kps[i] if i < len(kps) else None
-            render_frame(frame, kp, timeline, t, f"t={t:6.2f}s  {bpm_txt}  {sync_txt}")
+            render_frame(frame, kp, timeline, t, f"t = {t:6.2f} s   {sync_txt}".rstrip())
             writer.write(frame)
             i += 1
     finally:

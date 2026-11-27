@@ -93,9 +93,9 @@ Any warnings follow the table: an audio/visual sync disagreement, low music-alig
 2. **Zoom** on the first 6 s of dancing. Shows left/right foot horizontal speed (solid) and lift (dashed), the music beat grid (grey), and labelled footfalls (`L1, R2, L3-SLOW, R5, L6, R7-SLOW`).
 3. **Timing offset** for every step, with a rolling mean per epoch. Drift towards early or late shows up immediately.
 
-## 6. Video overlay and tempo dashboard
+## 6. Video overlay and rhythm dashboard
 
-**Skeleton + rhythm HUD video.** `main.py` renders `outputs/<id>/overlay_cam1.mp4` automatically after the analysis (skip it with `--no-overlay`). To re-render it on its own:
+**Skeleton + rhythm overlay video.** `main.py` renders `outputs/<id>/overlay_cam1.mp4` after the analysis (skip it with `--no-overlay`). To re-render it on its own:
 ```bash
 python overlay_video.py --config sessions.json --subject subject_01
 ```
@@ -103,30 +103,41 @@ For a quick preview of the first 20 s:
 ```bash
 python overlay_video.py --config sessions.json --subject subject_01 --max-seconds 20
 ```
-- **Skeleton:** the full MediaPipe skeleton, with the lower body in thick neon (cyan = left, magenta = right, yellow = hips).
-- **HUD, top-left:**
-  - `BAILANDO / ACTIVO` vs `EN PAUSA / IDLE`;
-  - the live 8-count `1 - 2 - 3 - (4) - 5 - 6 - 7 - (8)`;
-  - feedback on the last step: `A TIEMPO` (green, ≤ ±45 ms), `LEVEMENTE ADELANTADO/ATRASADO` (yellow, ≤ ±90 ms) or `FUERA DE TEMPO` (red, > 90 ms).
-- **Footfall ring:** a ring flashes around the stepping foot at each footfall.
-- **Encoding:** with ffmpeg available (on PATH, or the one bundled with `imageio-ffmpeg`), the video is re-encoded to browser-friendly H.264 with the original camera audio. Without ffmpeg it falls back to OpenCV `avc1`/`mp4v` with no audio.
+- **Skeleton.** The upper body is thin and semi-transparent. Legs, ankles, heels and toes are crisp and glowing: **electric cyan `#00E5FF` = left foot**, **magenta/coral `#FF4081` = right foot**.
+- **Footfall callouts.** For about 0.6 s after each footfall, a ring and a floating tag appear beside that foot. The tag reads `LEFT FOOT • BEAT 3` over a badge:
+  - `ON TIME (+12ms)` (green, ≤ ±45 ms);
+  - `EARLY (-68ms)` / `LATE (+70ms)` (amber, ≤ ±90 ms);
+  - `EARLY / LATE / OFF-BEAT (+115ms)` (red, > 90 ms).
+- **Bottom 8-count strip.** `1 2 3 [4] 5 6 7 [8]` lights the active beat with a progress fill, and flashes red on a beat where a timing error happened.
+- **Top chips.** `DANCING` / `IDLE`, the BPM, and the running on-time percentage.
+- **Encoding.** With ffmpeg available (on PATH, or bundled with `imageio-ffmpeg`), the output is browser-friendly H.264 with the original camera audio.
 
-**Interactive dashboard (Spanish UI).** It needs `epochs_and_steps.json` and, ideally, `overlay_cam1.mp4`:
+**Rhythm dashboard (English, single screen).** It needs `epochs_and_steps.json` and ideally `overlay_cam1.mp4`:
 ```bash
 python dashboard.py --config sessions.json --subject subject_01
 ```
-It opens `http://127.0.0.1:8765/` in your browser; Ctrl+C stops it. Use `--port` to change the port and `--no-browser` to not open a tab. It only needs the standard library and works offline.
-- **Video and music:** the overlay video plays alongside the clean `.mp3`, positioned with `mp3_offset_sec`.
-  - The *Ajuste de audio* slider (±500 ms) fine-tunes the music offset live. The step offsets in the chart and table update with it.
-  - Speed: `0.5×` *cámara lenta*, `0.75×`, `1.0×` *normal*.
-  - Optional Web Audio metronome on beats 1, 2, 3, 5, 6, 7 (accented on the 1).
-- **Veredicto general de tempo:** a 0–100% score, plus a verdict, KPI cards and coaching notes in Spanish.
-  - Score: 80% timing credit and 20% quick-quick-slow accuracy. Timing credit is full within ±45 ms, half at ±90 ms, and zero at half a beat.
-  - Verdict, for example *¡Excelente ritmo! En tempo* or *Tendencia a adelantarse*.
-  - KPI cards: BPM, % of steps on time, mean offset, consistency, 1-2-3/5-6-7 accuracy.
-  - Coaching notes cover beats 1 and 5, whether slow steps 3 and 7 rush, left/right symmetry, and drift between blocks.
-- **Línea de tiempo y tabla de pasos:** every step's `beat_offset_ms` is plotted with the green ±45 ms zone. Clicking a point or a table row jumps the video to that step.
-- **Off-beat warning:** if every step sits about half a beat from the pulse, the dashboard warns that the song's beat grid may be on the off-beat (*contratiempo*). Use the metronome to check, then fix `overrides.mp3_offset_sec`.
+It opens `http://127.0.0.1:8765/`. Options: `--port`, `--no-browser`, and `--read-only` (disables saving).
+- **Layout.** It fits one widescreen viewport (`100vh`, no page scroll).
+  - Left (≈55%): the video, transport, speed (`0.5x` / `0.75x` / `1.0x`), music / camera-audio / metronome toggles, the audio-sync calibration bar, and the **step error timeline**.
+  - Right (≈45%): the tempo score and verdict, KPI badges (BPM, On-tempo %, Mean offset, QQS accuracy), the **coaching diagnosis**, and a scrollable **rhythm error & step log**.
+- **Music sync.**
+  - The song is served as a sample-accurate WAV, decoded once by ffmpeg to `outputs/<id>/song_sync.wav`. Browsers only seek `.mp3` approximately, which was the main source of drift.
+  - The page keeps `audio.currentTime = video.currentTime − mp3_offset_sec` on play, pause, seek and rate change, and in a `requestAnimationFrame` loop that uses a frame-accurate video clock:
+    - drift above 40 ms is corrected with a gentle playback-rate trim;
+    - drift above 150 ms gets a hard re-seek;
+    - for 1.5 s after each (re)start, anything above 10 ms is trimmed, removing play() start-up latency.
+  - Music stays paused before the song starts, after it ends, and while the video is buffering. The live drift is shown in the calibration bar.
+- **Calibration bar.**
+  - `−50ms` / `−10` / `+10` / `+50ms` nudges, and a numeric `mp3_offset_sec` input. Every change re-scores all steps on the server.
+  - **Tap Beat 1 Now** snaps the nearest song beat 1 to the current video moment.
+  - **Save Offset to sessions.json** writes `overrides.mp3_offset_sec` through `POST /api/save-offset`. This endpoint takes JSON only, same-origin only, and writes the file atomically. Afterwards, re-run `python main.py --config sessions.json --session <id>` to re-score the steps and re-render the overlay with the new offset.
+- **Step error timeline.** Each step's error in ms over the recording, with a green ±45 ms band.
+  - Left foot = cyan ●, right foot = magenta ◆; amber = early/late; bright red = off-beat (> 90 ms).
+  - Hovering shows the foot, time (s), beat and error.
+  - Clicking a step replays from **1 s before** it.
+- **Step log.** `All steps` / `Errors only` toggle; columns `Time (s)`, `Foot`, `Beat`, `Error (ms)`, `Status`. Clicking a row jumps the video to that step.
+- **Keyboard.** Space = play/pause; ←/→ = ±1 s (Shift: ±0.1 s).
+- **Off-beat warning.** If every step sits about half a beat from the pulse, the dashboard warns that the song's beat grid is probably on the off-beat. Check with the metronome, then fix it with *Tap Beat 1 Now* and save.
 
 ## 7. Troubleshooting
 - **Sync `method` is `motion_xcorr`, or the offset looks wrong.** No clap was found in both cameras. Check `clap_frames_cam1/cam2` in `sync.json`, then set `overrides.frame_offset`. One way to find it: note the video frame of the clap in each camera, and use `cam2_frame - cam1_frame`.
@@ -148,8 +159,8 @@ It opens `http://127.0.0.1:8765/` in your browser; Ctrl+C stops it. Use `--port`
 | `salsa_rhythm.py` | Footfalls at touchdown with sub-frame timing, L/R alternation and TAPs, QUICK/SLOW and 8-count labels, beat offsets, step lengths, summaries |
 | `visualize.py` | `rhythm_analysis.png` |
 | `main.py` | Config loading and merging, batch orchestration, exports, summary table, overlay step |
-| `overlay_video.py` | Skeleton + rhythm HUD rendered onto cam1, H.264 + audio via ffmpeg |
-| `dashboard.py` | Local Spanish tempo dashboard (`http.server`): synced player, scorecard, coaching, clickable timeline and table |
+| `overlay_video.py` | Skeleton (glowing legs and feet), foot-specific timing callouts and an 8-count strip rendered onto cam1; H.264 + audio via ffmpeg |
+| `dashboard.py` | Local single-screen rhythm dashboard (`http.server`): drift-corrected video + music player, offset calibration and saving, scorecard, coaching, error timeline and step log |
 
 Each stage also has its own CLI for debugging (`pose_2d.py`, `sync.py`, `music_analyzer.py`).
 
@@ -157,7 +168,7 @@ Each stage also has its own CLI for debugging (`pose_2d.py`, `sync.py`, `music_a
 ```bash
 pytest -q
 ```
-75 synthetic tests (`tests/test_pipeline.py`, `tests/test_overlay_dashboard.py`); no video, audio or model files are needed. They include an end-to-end run of `main.py` on two simulated subjects:
+91 synthetic tests (`tests/test_pipeline.py`, `tests/test_overlay_dashboard.py`); no video, audio or model files are needed. They include an end-to-end run of `main.py` on two simulated subjects:
 - a timeline of 10 s idle with a clap, 16 s of 180 BPM basic steps, 8 s idle, and 16 s more stepping;
 - each subject projected into two virtual cameras;
 - checks: sync, epoch boundaries, zero idle/clap false steps, 100% QUICK/SLOW and beat-count accuracy, beat offsets including a deliberate 60 ms late drift, and all exported files.

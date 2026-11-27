@@ -176,6 +176,8 @@ def analyze_subject(
             for e in epochs
         ],
         "steps": [s.to_dict() for s in rhythm.steps],
+        # beat grid actually used for scoring (tempo-octave corrected), cam1 timeline
+        "beat_grid_sec": np.asarray(rhythm.beat_grid_sec, dtype=np.float64).tolist(),
         "summary": rhythm.summary,
         "warnings": all_warnings,
         "params": params,
