@@ -11,13 +11,37 @@
       "audio_confirm_tolerance_frames": 1,
       "motion_xcorr_max_lag_s": 10.0
     },
-    "music": {"bandpass_hz": [60, 250]},
-    "segmenter": {"window_s": 1.5, "hop_s": 0.25, "merge_gap_s": 1.2, "min_epoch_s": 2.5},
+    "music": {
+      "bandpass_hz": [
+        60,
+        250
+      ],
+      "sr": 22050,
+      "hop_length": 512,
+      "max_offset_s": null
+    },
+    "segmenter": {
+      "window_s": 1.5,
+      "hop_s": 0.25,
+      "merge_gap_s": 1.2,
+      "min_epoch_s": 2.5
+    },
     "calibration": {
       "visibility_min": 0.85,
       "focal_factor": 0.85,
       "height_eye_ratio": 0.935,
-      "span_percentile": 95
+      "span_percentile": 95,
+      "triangulation_visibility_min": 0.5,
+      "floor_percentile": 20,
+      "max_fundamental_points": 20000,
+      "ransac_threshold_px": 3.0,
+      "ransac_confidence": 0.99
+    },
+    "filters": {
+      "min_cutoff": 1.0,
+      "beta": 2.0,
+      "d_cutoff": 1.0,
+      "reset_gap_frames": 5
     }
   },
   "sessions": [
@@ -27,7 +51,10 @@
       "cam2": "data/subject_01/cam2.mp4",
       "song_mp3": "data/subject_01/song.mp3",
       "height_meters": 1.68,
-      "overrides": {"frame_offset": null, "mp3_offset_sec": null},
+      "overrides": {
+        "frame_offset": null,
+        "mp3_offset_sec": null
+      },
       "params": {}
     },
     {
@@ -36,7 +63,10 @@
       "cam2": "data/subject_02/cam2.mp4",
       "song_mp3": "data/subject_02/song.mp3",
       "height_meters": 1.75,
-      "overrides": {"frame_offset": null, "mp3_offset_sec": null},
+      "overrides": {
+        "frame_offset": null,
+        "mp3_offset_sec": null
+      },
       "params": {}
     }
   ]

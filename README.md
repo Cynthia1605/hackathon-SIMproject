@@ -14,9 +14,9 @@ On headless Linux, mediapipe also needs `libegl1` and `libgles2` (`apt-get insta
 | `landmarks.py` | MediaPipe 33-landmark index constants | done |
 | `pose_2d.py` | PoseLandmarker (heavy, VIDEO mode) to `(N,33,3)` `[x_px, y_px, vis]`, cached as `.npz` | done |
 | `sync.py` | cam1/cam2 frame offset: visual clap, >2.5 kHz audio check, hip/ankle motion xcorr fallback, manual override | done |
-| `music_analyzer.py` | librosa beat grid + mp3 to cam1 alignment | todo |
-| `calibrate_3d.py` | F-matrix/recoverPose extrinsics, triangulation, height scale, floor alignment | todo |
-| `filters.py` | 3D One Euro filter | todo |
+| `music_analyzer.py` | librosa HPSS beat grid + mp3 to cam1 alignment (`cam1_time = mp3_time + mp3_offset_sec`) | done |
+| `calibrate_3d.py` | F-matrix/recoverPose extrinsics, triangulation, height scale, floor at Y=0 (+Y up) | done |
+| `filters.py` | vectorised 3D One Euro filter, NaN-gap safe | done |
 | `epoch_segmenter.py` | active vs. idle epochs | todo |
 | `salsa_rhythm.py`, `visualize.py` | footfalls, QUICK/SLOW, beat offsets, plots | todo |
 | `main.py` | batch runner over `sessions.json` | todo |
@@ -30,6 +30,10 @@ Copy `sessions.example.json` to `sessions.json` and edit the paths and heights. 
 python pose_2d.py data/subject_01/cam1.mp4 --cache cache/subject_01/cam1_pose2d.npz
 python sync.py cache/subject_01/cam1_pose2d.npz cache/subject_01/cam2_pose2d.npz \
     --video1 data/subject_01/cam1.mp4 --video2 data/subject_01/cam2.mp4 --out outputs/subject_01/sync.json
+```
+
+```bash
+python music_analyzer.py data/subject_01/song.mp3 --cam1 data/subject_01/cam1.mp4 --out outputs/subject_01/music.json
 ```
 
 ## Tests
