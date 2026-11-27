@@ -18,6 +18,9 @@ DEFAULT_FILTER_PARAMS: dict[str, Any] = {
     "beta": 2.0,  # 1 / (m/s): how fast the cutoff opens up with speed
     "d_cutoff": 1.0,  # Hz
     "reset_gap_frames": 5,
+    # Offline zero-lag mode: average a forward and a time-reversed pass so the
+    # One Euro lag cancels and footfall timing is not delayed.
+    "bidirectional": True,
 }
 
 
@@ -80,6 +83,17 @@ def one_euro_filter(
     return out.reshape(shape)
 
 
+def one_euro_filter_bidirectional(x: np.ndarray, fps: float, **kw) -> np.ndarray:
+    """Mean of forward and backward One Euro passes (zero-lag, offline only)."""
+    fwd = one_euro_filter(x, fps, **kw)
+    bwd = one_euro_filter(np.asarray(x)[::-1], fps, **kw)[::-1]
+    return 0.5 * (fwd + bwd)  # NaN wherever the input was NaN in both passes
+
+
 def filter_points3d(points3d: np.ndarray, fps: float, params: dict[str, Any] | None = None) -> np.ndarray:
     p = {**DEFAULT_FILTER_PARAMS, **(params or {})}
-    return one_euro_filter(points3d, fps, p["min_cutoff"], p["beta"], p["d_cutoff"], int(p["reset_gap_frames"]))
+    kw = dict(min_cutoff=p["min_cutoff"], beta=p["beta"], d_cutoff=p["d_cutoff"],
+              reset_gap_frames=int(p["reset_gap_frames"]))
+    if p.get("bidirectional", True):
+        return one_euro_filter_bidirectional(points3d, fps, **kw)
+    return one_euro_filter(points3d, fps, **kw)

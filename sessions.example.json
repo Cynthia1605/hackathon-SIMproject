@@ -24,7 +24,16 @@
       "window_s": 1.5,
       "hop_s": 0.25,
       "merge_gap_s": 1.2,
-      "min_epoch_s": 2.5
+      "min_epoch_s": 2.5,
+      "range_ref_m": 0.1,
+      "lift_ref_m": 0.02,
+      "alt_ref_mps": 0.15,
+      "walk_travel_m": 0.8,
+      "start_frac": 0.4,
+      "stop_frac": 0.2,
+      "min_start_energy": 1.5,
+      "min_stop_energy": 0.8,
+      "motion_speed_mps": 0.15
     },
     "calibration": {
       "visibility_min": 0.85,
@@ -41,7 +50,18 @@
       "min_cutoff": 1.0,
       "beta": 2.0,
       "d_cutoff": 1.0,
-      "reset_gap_frames": 5
+      "reset_gap_frames": 5,
+      "bidirectional": true
+    },
+    "rhythm": {
+      "floor_height_m": 0.05,
+      "min_prominence_mps": 0.12,
+      "min_step_interval_s": 0.15,
+      "still_speed_mps": 0.08,
+      "still_speed_frac": 0.3,
+      "slow_ratio": 1.5,
+      "speed_smooth_frames": 3,
+      "count_one_foot": "auto"
     }
   },
   "sessions": [

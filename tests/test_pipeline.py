@@ -530,3 +530,337 @@ def test_one_euro_passes_through_constant_and_init():
     out = FL.one_euro_filter(x, 30.0)
     assert np.isnan(out[0, 1]).all()
     np.testing.assert_allclose(out[1:], 1.0)
+
+
+# =========================================================================== #
+# Step 3: synthetic end-to-end salsa timeline
+# =========================================================================== #
+import epoch_segmenter as ES  # noqa: E402
+import main as M  # noqa: E402
+import salsa_rhythm as SR_  # noqa: E402
+
+BPM = 180.0
+BEAT = 60.0 / BPM
+ACTIVE_WINDOWS = [(10.0, 26.0), (34.0, 50.0)]
+STEP_PLAN = {  # beat -> (foot, target z of that foot in body frame, lift height)
+    1: ("L", 0.25, 0.06), 2: ("R", -0.05, 0.035), 3: ("L", 0.0, 0.06),
+    5: ("R", -0.25, 0.06), 6: ("L", 0.05, 0.035), 7: ("R", 0.0, 0.06),
+}
+LEG = {"L": {"knee": 25, "foot": [27, 29, 31]}, "R": {"knee": 26, "foot": [28, 30, 32]}}
+
+
+def _smoothstep(u):
+    u = np.clip(u, 0, 1)
+    return u * u * (3 - 2 * u)
+
+
+def salsa_timeline(height=1.70, fps=30.0, duration=50.0, mp3_offset=1.7, late_s=(0.0, 0.06),
+                   jitter_s=0.010, seed=40):
+    """World-frame 3D trajectory of a dancer: idle + clap, then 1-2-3 5-6-7 epochs.
+
+    Returns (points (N,33,3), truth_steps, beat_grid_cam1, clap_time).
+    """
+    rng = np.random.default_rng(seed)
+    n = int(round(duration * fps))
+    t = np.arange(n) / fps
+    s = height / 1.70
+    T = body_template() * s
+    grid = mp3_offset + np.arange(0, int((duration + 2) / BEAT)) * BEAT
+
+    # ---- per-foot step events (touchdown time, target z, lift) ----
+    truth, events = [], {"L": [], "R": []}
+    for w, (w0, w1) in enumerate(ACTIVE_WINDOWS):
+        beats = grid[(grid >= w0 + 0.3) & (grid <= w1 - 0.1)]
+        for c, g in enumerate(beats):
+            b = c % 8 + 1
+            if b not in STEP_PLAN:
+                continue
+            foot, z, lift = STEP_PLAN[b]
+            td = g + late_s[w] + rng.normal(0, jitter_s)
+            events[foot].append((td, z * s, lift))
+            truth.append({"t": td, "foot": foot, "beat": b, "epoch": w,
+                          "timing_type": "SLOW" if b in (3, 7) else "QUICK", "beat_time": g})
+    def foot_track(foot):
+        z, y = np.zeros(n), np.zeros(n)
+        cur = 0.0
+        for td, target, lift in events[foot]:
+            dur = 0.22
+            u = (t - (td - dur)) / dur
+            m = (u >= 0) & (u <= 1)
+            z[t > td] = target
+            z[m] = cur + (target - cur) * _smoothstep(u[m])
+            y[m] = lift * np.sin(np.pi * u[m])
+            cur = target
+        # before the first event the foot stays at 0; z after last event persists
+        first = events[foot][0][0] - 0.22 if events[foot] else np.inf
+        z[t < first] = 0.0
+        return z, y
+
+    tracks = {f: foot_track(f) for f in ("L", "R")}
+    pts = np.zeros((n, 33, 3))
+    clap_t = 5.0
+    for i in range(n):
+        B = T.copy()
+        zl, yl = tracks["L"][0][i], tracks["L"][1][i]
+        zr, yr = tracks["R"][0][i], tracks["R"][1][i]
+        for f, zz, yy in (("L", zl, yl), ("R", zr, yr)):
+            B[LEG[f]["foot"], 2] += zz
+            B[LEG[f]["foot"], 1] += yy
+            B[LEG[f]["knee"], 2] += 0.5 * zz
+            B[LEG[f]["knee"], 1] += 0.4 * yy
+        upper = [j for j in range(33) if j not in (25, 26, 27, 28, 29, 30, 31, 32)]
+        B[upper, 2] += 0.5 * (zl + zr)
+        B[upper, 1] += 0.01 * np.sin(2 * np.pi * 0.2 * t[i])  # breathing / sway
+        # idle clap: raise hands to chest, clap at clap_t, lower
+        raise_w = _smoothstep((t[i] - 4.0) / 0.5) - _smoothstep((t[i] - 6.0) / 0.5)
+        if raise_w > 0:
+            dtc = t[i] - clap_t
+            close = 1.0 - (_smoothstep((dtc + 0.12) / 0.12) - _smoothstep((dtc - 0.06) / 0.3))
+            half = 0.015 + (0.22 - 0.015) * close
+            for hand, sign in (([15, 17, 19, 21], 1), ([16, 18, 20, 22], -1)):
+                tgt = B[hand].copy()
+                tgt[:, 0] = sign * half
+                tgt[:, 1] = 1.25 * s + (B[hand, 1] - B[hand[0], 1])
+                tgt[:, 2] = 0.30
+                B[hand] = (1 - raise_w) * B[hand] + raise_w * tgt
+        yaw = np.deg2rad(12) * np.sin(2 * np.pi * t[i] / 60)
+        Ry = np.array([[np.cos(yaw), 0, np.sin(yaw)], [0, 1, 0], [-np.sin(yaw), 0, np.cos(yaw)]])
+        pts[i] = B @ Ry.T + np.array([0.1, 0.0, 0.15])
+    return pts, truth, grid, clap_t
+
+
+def synthetic_subject(height, offset_frames, seed, late_s=(0.0, 0.06)):
+    world, truth, grid, clap_t = salsa_timeline(height=height, seed=seed, late_s=late_s)
+    kp1, kp2 = two_camera_views(world, seed=seed + 1)
+    if offset_frames >= 0:  # cam2 started earlier: cam2_frame = cam1_frame + offset
+        kp2 = np.concatenate([np.repeat(kp2[:1], offset_frames, axis=0), kp2])
+    else:  # cam1 started earlier
+        kp2 = kp2[-offset_frames:]
+    song = MA.SongAnalysis(bpm=BPM, beat_times_sec=grid - 1.7, onset_env=np.zeros(1), sr=SR,
+                           hop_length=512, duration_sec=60.0)
+    music = MA.build_alignment(song, 1.7, "xcorr", 0.9)
+    return make_pose(kp1), make_pose(kp2), music, truth, clap_t
+
+
+def match_truth(steps, truth, tol=0.1):
+    """Greedy 1:1 match of detected steps to truth by time."""
+    tt = np.array([x["t"] for x in truth])
+    pairs, used = [], set()
+    for s in steps:
+        j = int(np.argmin(np.abs(tt - s["timestamp_sec"])))
+        if abs(tt[j] - s["timestamp_sec"]) <= tol and j not in used:
+            used.add(j)
+            pairs.append((s, truth[j]))
+    return pairs
+
+
+SUBJECTS = {  # id -> (height, cam2 frame offset, seed)
+    "subject_A": (1.70, 9, 40),
+    "subject_B": (1.62, -6, 50),
+}
+
+
+@pytest.fixture(scope="module")
+def e2e_run(tmp_path_factory):
+    """Run main.main() on two synthetic subjects with pose + music I/O stubbed."""
+    tmp = tmp_path_factory.mktemp("e2e")
+    data = {sid: synthetic_subject(h, off, seed) for sid, (h, off, seed) in SUBJECTS.items()}
+    cfg = json.loads((Path(__file__).resolve().parents[1] / "sessions.example.json").read_text())
+    cfg["sessions"] = [
+        {"id": sid, "cam1": f"data/{sid}/cam1.mp4", "cam2": f"data/{sid}/cam2.mp4",
+         "song_mp3": f"data/{sid}/song.mp3", "height_meters": h,
+         "overrides": {"frame_offset": None, "mp3_offset_sec": None}, "params": {}}
+        for sid, (h, _, _) in SUBJECTS.items()
+    ]
+    cfg_path = tmp / "sessions.json"
+    cfg_path.write_text(json.dumps(cfg))
+
+    def fake_pose(video_path, cache_path, model_path=None, force=False):
+        p = Path(video_path)
+        sid, cam = p.parent.name, p.stem
+        return data[sid][0] if cam == "cam1" else data[sid][1]
+
+    def fake_music(song_mp3, cam1_video, manual_offset_sec=None, params=None, song=None):
+        return data[Path(song_mp3).parent.name][2]
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(M.pose_2d, "load_or_extract", fake_pose)
+    mp.setattr(M.music_analyzer, "align_music", fake_music)
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = M.main(["--config", str(cfg_path)])
+    mp.undo()
+    reports = {sid: json.loads((tmp / "outputs" / sid / "epochs_and_steps.json").read_text()) for sid in SUBJECTS}
+    return {"rc": rc, "stdout": buf.getvalue(), "tmp": tmp, "data": data, "reports": reports}
+
+
+import json  # noqa: E402
+
+
+def test_e2e_runs_and_prints_summary(e2e_run):
+    assert e2e_run["rc"] == 0
+    out = e2e_run["stdout"]
+    for sid in SUBJECTS:
+        assert sid in out
+    assert "BPM" in out and "QQS acc" in out and "100%" in out
+
+
+@pytest.mark.parametrize("sid", list(SUBJECTS))
+def test_e2e_outputs_written(e2e_run, sid):
+    d = e2e_run["tmp"] / "outputs" / sid
+    for f in ("sync.json", "epochs_and_steps.json", "steps.csv", "rhythm_analysis.png"):
+        assert (d / f).is_file() and (d / f).stat().st_size > 0
+    assert (d / "rhythm_analysis.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    import csv
+
+    with open(d / "steps.csv") as fh:
+        rows = list(csv.DictReader(fh))
+    assert list(rows[0].keys()) == M.CSV_COLUMNS
+    assert len(rows) == len(e2e_run["reports"][sid]["steps"])
+    assert {r["subject_id"] for r in rows} == {sid}
+
+
+@pytest.mark.parametrize("sid", list(SUBJECTS))
+def test_e2e_sync_and_epoch_boundaries(e2e_run, sid):
+    rep = e2e_run["reports"][sid]
+    assert rep["sync"]["method"] == "clap"
+    assert rep["sync"]["frame_offset"] == SUBJECTS[sid][1]
+    eps = rep["epochs"]
+    assert len(eps) == 2
+    for ep, (w0, w1) in zip(eps, ACTIVE_WINDOWS):
+        assert ep["label"] == "ACTIVE_MOVE"
+        assert abs(ep["start_sec"] - w0) <= 0.75
+        assert abs(ep["end_sec"] - w1) <= 0.75
+    clap_t = e2e_run["data"][sid][4]
+    assert not any(ep["start_sec"] <= clap_t <= ep["end_sec"] for ep in eps)
+
+
+@pytest.mark.parametrize("sid", list(SUBJECTS))
+def test_e2e_no_false_steps_in_idle_or_clap(e2e_run, sid):
+    steps = e2e_run["reports"][sid]["steps"]
+    idle = [(0.0, ACTIVE_WINDOWS[0][0]), (ACTIVE_WINDOWS[0][1], ACTIVE_WINDOWS[1][0])]
+    for s in steps:
+        assert not any(a <= s["timestamp_sec"] < b for a, b in idle), s
+    assert all(s["timing_type"] != "TAP" for s in steps)
+
+
+@pytest.mark.parametrize("sid", list(SUBJECTS))
+def test_e2e_quick_slow_classification_is_perfect(e2e_run, sid):
+    rep, truth = e2e_run["reports"][sid], e2e_run["data"][sid][3]
+    steps = rep["steps"]
+    pairs = match_truth(steps, truth)
+    assert len(steps) == len(truth) == len(pairs) == 72
+    for s, tr in pairs:
+        assert s["foot"] == tr["foot"]
+        assert s["timing_type"] == tr["timing_type"], (s, tr)
+        assert s["beat_count"] == tr["beat"], (s, tr)
+        if tr["beat"] in (3, 7):
+            assert s["hold_after"] == ("4-hold" if tr["beat"] == 3 else "8-hold")
+    assert rep["summary"]["qqs_pattern_accuracy"] == pytest.approx(1.0)
+    labels = [s["label"] for s in steps[:6]]
+    assert labels == ["L1", "R2", "L3-SLOW", "R5", "L6", "R7-SLOW"]
+
+
+@pytest.mark.parametrize("sid", list(SUBJECTS))
+def test_e2e_beat_offsets_and_drift(e2e_run, sid):
+    rep, truth = e2e_run["reports"][sid], e2e_run["data"][sid][3]
+    for s, tr in match_truth(rep["steps"], truth):
+        true_off = (tr["t"] - tr["beat_time"]) * 1000
+        assert s["beat_offset_ms"] == pytest.approx(true_off, abs=35)
+        assert s["nearest_music_beat_sec"] == pytest.approx(tr["beat_time"], abs=1e-6)
+    m0, m1 = (e["summary"]["mean_offset_ms"] for e in rep["epochs"])
+    assert abs(m0) < 30  # epoch 1 danced on the beat
+    assert m1 - m0 == pytest.approx(60, abs=20)  # epoch 2 deliberately 60 ms late
+    lengths = [s["step_length_cm"] for s in rep["steps"]]
+    assert 15 < np.median(lengths) < 35
+
+
+# --------------------------------------------------------------------------- #
+# Step 3 unit tests
+# --------------------------------------------------------------------------- #
+def _feet_only_trajectory(n, fps, active_mask, seed=60):
+    """Simple feet-only 3D track: alternating steps (L/R) where active_mask is True."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n) / fps
+    pts = np.zeros((n, 33, 3))
+    pts[:, :, 1] = 1.0
+    for f, (idxs, ph) in {"L": ([27, 29, 31], 0.0), "R": ([28, 30, 32], np.pi)}.items():
+        osc = np.where(active_mask, 0.12 * np.sin(2 * np.pi * 1.5 * t + ph), 0.0)
+        lift = np.where(active_mask, 0.05 * np.maximum(0, np.sin(2 * np.pi * 1.5 * t + ph)), 0.0)
+        pts[:, idxs, 2] = osc[:, None]
+        pts[:, idxs, 1] = lift[:, None]
+        pts[:, idxs, 0] = 0.1 if f == "L" else -0.1
+    pts[:, [23, 24], 1] = 0.95
+    return pts + rng.normal(0, 0.002, pts.shape)
+
+
+def test_segmenter_idle_and_clapping_only_gives_no_epochs():
+    fps, n = 30.0, 600
+    pts = _feet_only_trajectory(n, fps, np.zeros(n, bool))
+    t = np.arange(n) / fps
+    pts[:, [15, 17, 19], 0] = (0.2 * np.abs(np.sin(2 * np.pi * 2 * t)))[:, None]  # vigorous clapping
+    epochs, diag = ES.segment_epochs(pts, fps)
+    assert epochs == []
+
+
+def test_segmenter_merges_short_holds_and_drops_short_bursts():
+    fps, n = 30.0, 900
+    t = np.arange(n) / fps
+    active = ((t >= 3) & (t < 9)) | ((t >= 9.6) & (t < 15)) | ((t >= 22) & (t < 23.5))
+    epochs, _ = ES.segment_epochs(_feet_only_trajectory(n, fps, active), fps)
+    assert len(epochs) == 1  # 0.6 s hold merged, 1.5 s burst dropped
+    assert abs(epochs[0].start_sec - 3) <= 0.75 and abs(epochs[0].end_sec - 15) <= 0.75
+    d = epochs[0].to_dict()
+    assert d["label"] == "ACTIVE_MOVE" and d["cam1_end_frame"] >= d["cam1_start_frame"]
+
+
+def test_segmenter_ignores_walking_in():
+    fps, n = 30.0, 450
+    t = np.arange(n) / fps
+    active = np.ones(n, bool)
+    pts = _feet_only_trajectory(n, fps, active)
+    pts[:, :, 2] += (1.2 * t)[:, None]  # whole body travels 1.2 m/s
+    assert ES.segment_epochs(pts, fps)[0] == []
+
+
+def test_same_foot_double_trigger_is_tap():
+    p = SR_.DEFAULT_RHYTHM_PARAMS
+    fps = 30.0
+    ev = [(0, "L"), (10, "R"), (20, "L"), (25, "L"), (40, "R")]
+    out = SR_.classify_epoch_steps(ev, fps, BEAT, p)
+    assert [o["timing_type"] for o in out] == ["QUICK", "QUICK", "SLOW", "TAP", "QUICK"]
+
+
+def test_beat_period_fallback_and_octave_correction():
+    un = MA.MusicAlignment(0.0, float("nan"), 0.0, [], "unaligned", 0.0)
+    per, grid, w = SR_.resolve_beat_period(un, 0.333)
+    assert per == pytest.approx(0.333) and len(grid) == 0 and w
+    half = MA.MusicAlignment(90.0, 0.667, 0.0, list(np.arange(0, 10, 0.6667)), "xcorr", 0.8)
+    per, grid, w = SR_.resolve_beat_period(half, 0.333)
+    assert per == pytest.approx(0.3333, abs=0.002) and len(grid) > 25 and w
+    assert SR_.step_interval_period(np.array([0, 0.33, 0.66, 1.33, 1.66, 2.0, 2.66])) == pytest.approx(0.33, abs=0.01)
+
+
+def test_load_config_merges_and_resolves(tmp_path):
+    cfg = {
+        "output_root": "out", "cache_dir": "cache", "model_path": "m.task",
+        "defaults": {"sync": {"clap_threshold_sw": 0.4}, "segmenter": {"min_epoch_s": 3.0}},
+        "sessions": [{"id": "s1", "cam1": "a.mp4", "cam2": "/abs/b.mp4", "song_mp3": "s.mp3",
+                      "height_meters": 1.6, "params": {"segmenter": {"min_epoch_s": 4.0}}}],
+    }
+    (tmp_path / "sessions.json").write_text(json.dumps(cfg))
+    c = M.load_config(tmp_path / "sessions.json")
+    s = c["sessions"][0]
+    assert s["cam1"] == str(tmp_path / "a.mp4") and s["cam2"] == "/abs/b.mp4"
+    assert c["output_root"] == str(tmp_path / "out")
+    assert s["params"]["sync"]["clap_threshold_sw"] == 0.4
+    assert s["params"]["sync"]["min_closing_speed_sw_per_s"] == 3.0  # module default kept
+    assert s["params"]["segmenter"]["min_epoch_s"] == 4.0  # session beats defaults
+    assert s["overrides"] == {"frame_offset": None, "mp3_offset_sec": None}
+    bad = dict(cfg, sessions=[{"id": "x", "cam1": "a"}])
+    (tmp_path / "bad.json").write_text(json.dumps(bad))
+    with pytest.raises(ValueError):
+        M.load_config(tmp_path / "bad.json")
