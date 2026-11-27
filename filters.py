@@ -97,3 +97,39 @@ def filter_points3d(points3d: np.ndarray, fps: float, params: dict[str, Any] | N
     if p.get("bidirectional", True):
         return one_euro_filter_bidirectional(points3d, fps, **kw)
     return one_euro_filter(points3d, fps, **kw)
+
+
+class OneEuroFilterStream:
+    """Streaming (sample-by-sample) One Euro filter for vectors, used by the live webcam coach.
+
+    ``f(t, x)`` returns the filtered value of ``x`` (any shape; the derivative uses the
+    vector norm). NaN input returns NaN and leaves the state untouched. A gap longer
+    than ``reset_gap_s`` restarts the filter from the next sample.
+    """
+
+    def __init__(self, min_cutoff: float = 1.0, beta: float = 2.0, d_cutoff: float = 1.0, reset_gap_s: float = 0.25):
+        self.min_cutoff, self.beta, self.d_cutoff, self.reset_gap_s = min_cutoff, beta, d_cutoff, reset_gap_s
+        self.x_hat = None
+        self.dx_hat = None
+        self.t_last = None
+
+    def reset(self) -> None:
+        self.x_hat = self.dx_hat = self.t_last = None
+
+    def __call__(self, t: float, x) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        if not np.all(np.isfinite(x)):
+            return np.full_like(x, np.nan)
+        if self.t_last is None or t - self.t_last > self.reset_gap_s or t <= self.t_last:
+            if self.t_last is not None and t <= self.t_last and t > self.t_last - 1e-9:
+                return self.x_hat.copy()
+            self.x_hat, self.dx_hat, self.t_last = x.copy(), np.zeros_like(x), t
+            return x.copy()
+        dt = t - self.t_last
+        dx = (x - self.x_hat) / dt
+        a_d = float(_alpha(self.d_cutoff, dt))
+        self.dx_hat = a_d * dx + (1 - a_d) * self.dx_hat
+        a = float(_alpha(self.min_cutoff + self.beta * float(np.linalg.norm(self.dx_hat)), dt))
+        self.x_hat = a * x + (1 - a) * self.x_hat
+        self.t_last = t
+        return self.x_hat.copy()

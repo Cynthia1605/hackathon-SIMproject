@@ -155,14 +155,60 @@ It opens `http://127.0.0.1:8765/`. Options: `--port`, `--no-browser`, and `--rea
   - **Export.** `main.py` also writes these as `footwork` (metrics, ideal pattern, per-step floor positions) and `floor_x_cm` / `floor_y_cm` / `placement_err_cm` per step in `epochs_and_steps.json`.
 - **Off-beat warning.** If every step sits about half a beat from the pulse, the dashboard warns that the song's beat grid is probably on the off-beat. Check with the metronome, then fix it with *Tap Beat 1 Now* and save.
 
-## 7. Troubleshooting
+## 7. Live Webcam Coach (single laptop webcam, real time)
+
+The offline two-camera pipeline is unchanged; this is an extra mode in the same dashboard.
+
+Open the live page directly:
+```bash
+python dashboard.py --config sessions.json --live --camera 0
+```
+Or start the dashboard as usual and click **Live Webcam Coach** in the header:
+```bash
+python dashboard.py --config sessions.json
+```
+For the best frame rate on a CPU, add `--live-model lite`. This downloads `models/pose_landmarker_lite.task` (5.6 MB) on first use. Without the flag, `lite` or `full` is used if present in `models/`, otherwise `heavy`.
+```bash
+python dashboard.py --config sessions.json --live --live-model lite
+```
+
+1. Stand 2–3 m from the laptop, facing it, with your **whole body including your feet** in view.
+2. Pick the camera and the music: the **built-in salsa clave / cowbell metronome** (120–200 BPM, son clave 3-2, cowbell accent on 1), or any song from `sessions.json` or `data/`.
+3. Press **▶ Start Live Session** and dance the On-1 basic (1-2-3, hold, 5-6-7, hold).
+4. Watch the skeleton, ankle callouts and the 8-count strip on the video, the **Live Top-Down Footwork Map**, and the score / coaching / step log on the right.
+5. **Save Session** exports to `outputs/live_<timestamp>/`:
+   - `cam1.mp4`, `overlay_cam1.mp4`;
+   - `epochs_and_steps.json`, `steps.csv`, `sync.json`;
+   - the song, or a `metronome.wav` click track matching the recording.
+
+   It also adds the session to `sessions.json` (marked `"live": true`, which `main.py` skips). Its link opens it in **Recorded Sessions** with the full V2 player, error timeline and footwork map.
+
+**How it works** (`realtime.py`)
+- **The browser is the master clock.** It plays the song or the Web Audio metronome, and every 200 ms posts the audio position you hear (output latency subtracted) to `POST /api/live/clock`. The server maps that onto its own clock (median offset; pauses, seeks and BPM changes reset it). The header shows the sync jitter (typically ±2 ms).
+- **Pose.** MediaPipe Pose Landmarker (VIDEO mode, 1 person) runs on the newest camera frame only, dropping older frames so it never lags behind real time:
+  - 2D landmarks draw the skeleton;
+  - 3D `pose_world_landmarks` (metres) drive step detection and the floor map.
+- **Steps.**
+  - **Signal.** A step is a change of the left-to-right foot vector (x, z), which hip motion doesn't affect, or one foot lifting (so in-place replace steps count). The foot that lifted is the stepping foot.
+  - **Timing.** The plant time is refined on a rolling 2 s raw buffer: the moment the foot covered 97% of its travel, or its lift dropped. This avoids filter lag.
+  - **Latency.** Detection lands about 60–150 ms after touchdown.
+  - **Classification.** Each step is scored against the nearest beat: `ON TIME` (≤ ±45 ms), `EARLY` / `LATE` (≤ ±90 ms), `EARLY / LATE / OFF-BEAT` (> 90 ms). Stepping on 4 or 8 is flagged as "stepped on hold", and a same-foot double step as a tap.
+- **Floor map.** Each new step is placed relative to the planted foot (chaining from step to step), in a frame aligned with the dancer's facing direction. Targets are the ideal On-1 basic scaled to the height you enter (mirrored automatically if you step on 1 with the right foot).
+- **Coaching** updates every 2 bars, e.g. *"Rushing beat 3 on left foot (−91 ms) — hold your slow step."*
+
+**Calibration & limits**
+- **Cam latency** (default 60 ms) compensates the webcam's capture delay. If every step reads consistently late or early, adjust it. **Count +1** moves the 8-count if the "1" lands on the wrong beat (songs have no downbeat marker).
+- **Facing direction.** A single camera cannot recover depth as well as the stereo pipeline. Face the camera roughly (within about 30°) for reliable forward/back steps.
+- **Restarting the song.** If you restart the song during a recording, the saved replay aligns the music with its first playthrough.
+
+## 8. Troubleshooting
 - **Sync `method` is `motion_xcorr`, or the offset looks wrong.** No clap was found in both cameras. Check `clap_frames_cam1/cam2` in `sync.json`, then set `overrides.frame_offset`. One way to find it: note the video frame of the clap in each camera, and use `cam2_frame - cam1_frame`.
 - **Every step is off by the same amount.** The song probably did not start exactly with the video. In the dashboard, turn on the metronome, use *Tap Beat 1 Now* or the ±50 ms nudges until the clicks match the music, then *Save Offset to sessions.json* and re-run `main.py` for that session.
 - **Too few or too many epochs.** Tune `segmenter.min_start_energy` / `min_stop_energy`, and see the energy curve in panel 1.
 - **Beats 1-2-3 and 5-6-7 swapped.** The count is anchored on the first foot of the first complete quick-quick-slow group. If needed, force the beat-1 foot with `rhythm.count_one_foot` (`"L"` or `"R"`).
 - **High reprojection error in `calibration`.** Usually a bad sync offset, or a camera that doesn't see the whole body.
 
-## 8. Modules
+## 9. Modules
 | Module | Role |
 |---|---|
 | `landmarks.py` | MediaPipe 33-landmark index constants |
@@ -176,16 +222,26 @@ It opens `http://127.0.0.1:8765/`. Options: `--port`, `--no-browser`, and `--rea
 | `visualize.py` | `rhythm_analysis.png` |
 | `main.py` | Config loading and merging, batch orchestration, exports, summary table, overlay step |
 | `overlay_video.py` | Skeleton (glowing legs and feet), foot-specific timing callouts and an 8-count strip rendered onto cam1; H.264 + audio via ffmpeg |
+| `realtime.py` | Live Webcam Coach: browser-clock sync, metronome/song beat grid, streaming step detector, live floor map, coaching, camera/MediaPipe threads, MJPEG, Save Session |
 | `footwork.py` | Top-down floor reconstruction: facing-aligned floor frame, ideal On-1 basic scaled to height, placement error, step length, forward/back symmetry, drift |
 | `dashboard.py` | Local single-screen rhythm dashboard (`http.server`): drift-corrected video + music player, offset calibration and saving, scorecard, coaching, top-down footwork map, error timeline and step log |
 
 Each stage also has its own CLI for debugging (`pose_2d.py`, `sync.py`, `music_analyzer.py`).
 
-## 9. Tests
+## 10. Tests
 ```bash
 pytest -q
 ```
-108 synthetic tests (`tests/test_pipeline.py`, `tests/test_overlay_dashboard.py`); no video, audio or model files are needed. They include an end-to-end run of `main.py` on two simulated subjects:
+127 synthetic tests (`tests/test_pipeline.py`, `tests/test_overlay_dashboard.py`, `tests/test_realtime.py`); no video, audio or model files are needed. They include an end-to-end run of `main.py` on two simulated subjects:
 - a timeline of 10 s idle with a clap, 16 s of 180 BPM basic steps, 8 s idle, and 16 s more stepping;
 - each subject projected into two virtual cameras;
 - checks: sync, epoch boundaries, zero idle/clap false steps, 100% QUICK/SLOW and beat-count accuracy, beat offsets including a deliberate 60 ms late drift, and all exported files.
+
+`tests/test_realtime.py` covers the live coach without a webcam:
+- **Streaming step detection** on synthetic MediaPipe-like world-landmark streams: 30 / 24 fps, 200 BPM, a dancer turned 25°, and noise. Every step is detected with the right foot, the right 8-count and a timing error of ±30 ms or better, and nothing is detected while idle or clapping.
+- **Live classification:** On Time / Early / Late / Off-beat, hold, tap.
+- **Coaching** every 2 bars.
+- **Clock and beat grid.**
+- **Floor positions**, including the mirrored pattern for right-foot leads.
+- **Model selection.**
+- **End to end:** a threaded run of the live engine with a fake camera and pose estimator through every `/api/live/*` route, including the MJPEG stream, CSRF checks, Save Session, and replay in Recorded Sessions.

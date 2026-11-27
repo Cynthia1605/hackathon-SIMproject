@@ -407,12 +407,64 @@ def prepare_sync_audio(song: Path, out_dir: Path) -> Path:
 RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
-def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str, Path | None],
-                 save_cb: Callable[[float], dict[str, Any]] | None, state: dict[str, Any],
-                 floor: dict[str, Any] | None = None):
+class Subject:
+    """One recorded session served by the dashboard."""
+
+    def __init__(self, sid: str, report: dict[str, Any], media: dict[str, Any], video: Path | None,
+                 audio: Path | None, floor: dict[str, Any] | None = None, default_offset: float = 0.0,
+                 save_cb: Callable[[float], dict[str, Any]] | None = None):
+        self.sid, self.report, self.media, self.floor, self.save_cb = sid, report, media, floor, save_cb
+        self.files = {"video": video, "audio": audio}
+        self.state: dict[str, Any] = {"saved_offset": None, "default_offset": float(default_offset)}
+
+
+class SubjectStore:
+    """Recorded sessions by id (``?subject=``), loaded lazily so newly saved live sessions appear."""
+
+    def __init__(self, loader: Callable[[str], Subject] | None = None, ids: Callable[[], list[str]] | None = None,
+                 default: str | None = None):
+        self.loader, self._ids, self.default = loader, ids or (lambda: []), default
+        self._cache: dict[str, Subject] = {}
+        self._lock = threading.Lock()
+
+    @classmethod
+    def single(cls, subj: Subject) -> "SubjectStore":
+        st = cls(ids=lambda: [subj.sid], default=subj.sid)
+        st._cache[subj.sid] = subj
+        return st
+
+    def ids(self) -> list[str]:
+        try:
+            return list(self._ids())
+        except Exception as exc:
+            log.warning("listing subjects failed: %s", exc)
+            return list(self._cache)
+
+    def get(self, sid: str | None = None) -> Subject | None:
+        sid = sid or self.default or next(iter(self.ids()), None)
+        if not sid:
+            return None
+        with self._lock:
+            if sid in self._cache:
+                return self._cache[sid]
+            if self.loader is None:
+                return None
+            try:
+                subj = self.loader(sid)
+            except (Exception, SystemExit) as exc:
+                log.warning("cannot load subject %s: %s", sid, exc)
+                return None
+            self._cache[sid] = subj
+            return subj
+
+
+def make_handler(store: SubjectStore, live=None):
     page = INDEX_HTML.encode("utf-8")
+    live_page = LIVE_HTML.encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
         def log_message(self, fmt, *args):  # quiet
             log.debug(fmt, *args)
 
@@ -426,7 +478,8 @@ def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str,
                 self.wfile.write(body)
 
         def _json(self, code: int, obj: Any):
-            self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            self._send(code, json.dumps(obj, ensure_ascii=False, default=_json_default).encode("utf-8"),
+                       "application/json; charset=utf-8")
 
         def _file(self, path: Path):
             size = path.stat().st_size
@@ -470,16 +523,28 @@ def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str,
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # browser cancelled a range request while seeking
 
+        def _not_found(self):
+            return self._send(404, b"Not found", "text/plain; charset=utf-8")
+
         def do_HEAD(self):
             self.do_GET()
 
         def do_GET(self):
             parts = urlsplit(self.path)
-            route = parts.path
+            route, q = parts.path, parse_qs(parts.query)
             if route in ("/", "/index.html"):
+                if store.get(q.get("subject", [None])[0]) is None and live is not None:
+                    self.send_response(302)
+                    self.send_header("Location", "/live")
+                    self.end_headers()
+                    return
                 return self._send(200, page, "text/html; charset=utf-8")
+            if route == "/api/subjects":
+                return self._json(200, {"subjects": store.ids(), "default": store.default, "live": live is not None})
             if route == "/api/data":
-                q = parse_qs(parts.query)
+                subj = store.get(q.get("subject", [None])[0])
+                if subj is None:
+                    return self._json(404, {"ok": False, "error": "unknown subject"})
                 off = None
                 if "mp3_offset" in q:
                     try:
@@ -488,53 +553,156 @@ def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str,
                             raise ValueError
                     except ValueError:
                         return self._json(400, {"ok": False, "error": "invalid mp3_offset"})
-                data = build_dashboard_data(report, dict(media, can_save=save_cb is not None,
-                                                         saved_offset=state.get("saved_offset")), off, floor,
-                                            state["default_offset"])
+                data = build_dashboard_data(subj.report, dict(subj.media, can_save=subj.save_cb is not None,
+                                                              saved_offset=subj.state.get("saved_offset")),
+                                            off, subj.floor, subj.state["default_offset"])
+                data["subject_id"] = data.get("subject_id") or subj.sid
                 return self._json(200, data)
             if route in ("/media/video", "/media/audio"):
-                f = files.get(route.rsplit("/", 1)[-1])
+                subj = store.get(q.get("subject", [None])[0])
+                f = None if subj is None else subj.files.get(route.rsplit("/", 1)[-1])
                 if f is not None and Path(f).is_file():
                     return self._file(Path(f))
-            return self._send(404, b"Not found", "text/plain; charset=utf-8")
+                return self._not_found()
+            if live is not None and (route == "/live" or route.startswith("/api/live/")):
+                return self._live_get(route, q)
+            return self._not_found()
 
-        def do_POST(self):
-            if urlsplit(self.path).path != "/api/save-offset":
-                return self._send(404, b"Not found", "text/plain; charset=utf-8")
-            # CSRF guard: JSON only (forces a CORS preflight that we never approve) and same-origin.
+        # ---------------- live webcam coach ----------------
+        def _live_get(self, route: str, q: dict[str, list[str]]):
+            if route == "/live":
+                return self._send(200, live_page, "text/html; charset=utf-8")
+            if route == "/api/live/state":
+                return self._json(200, live.state())
+            if route == "/api/live/cameras":
+                return self._json(200, {"cameras": live.cameras(refresh="refresh" in q)})
+            if route == "/api/live/songs":
+                return self._json(200, {"songs": [{"id": s["id"], "name": s["name"]} for s in live.songs()]})
+            if route == "/api/live/song":
+                try:
+                    p = live.song_path(int(q.get("id", ["-1"])[0]))
+                except ValueError:
+                    p = None
+                return self._file(p) if p is not None and p.is_file() else self._not_found()
+            if route == "/api/live/stream":
+                return self._mjpeg(once="once" in q)
+            return self._not_found()
+
+        def _mjpeg(self, once: bool = False):
+            if once:
+                return self._send(200, live.wait_jpeg(-1, 0.0)[1], "image/jpeg")
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            seq = -1
+            try:
+                while not getattr(self.server, "_closing", False):
+                    seq, jpg = live.wait_jpeg(seq, 1.0)
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(jpg))
+                    self.wfile.write(jpg)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # client went away
+
+        def _read_json(self) -> tuple[dict | None, bool]:
+            """CSRF guard (JSON only, same-origin) + bounded body. Returns (body, ok)."""
             if not self.headers.get("Content-Type", "").startswith("application/json"):
-                return self._json(415, {"ok": False, "error": "Content-Type must be application/json"})
+                self._json(415, {"ok": False, "error": "Content-Type must be application/json"})
+                return None, False
             origin = self.headers.get("Origin")
-            host = self.headers.get("Host", "")
-            if origin and urlsplit(origin).netloc != host:
-                return self._json(403, {"ok": False, "error": "cross-origin request refused"})
-            if save_cb is None:
-                return self._json(403, {"ok": False, "error": "saving is disabled"})
+            if origin and urlsplit(origin).netloc != self.headers.get("Host", ""):
+                self._json(403, {"ok": False, "error": "cross-origin request refused"})
+                return None, False
             try:
                 n = int(self.headers.get("Content-Length", "0"))
-                if n <= 0 or n > 4096:
+                if n < 0 or n > 8192:
                     raise ValueError("bad body size")
-                body = json.loads(self.rfile.read(n))
-                res = save_cb(float(body["mp3_offset_sec"]))
-            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-                return self._json(400, {"ok": False, "error": str(exc)})
-            state["saved_offset"] = res["mp3_offset_sec"]
-            state["default_offset"] = res["mp3_offset_sec"]  # sessions.json now holds this value
-            return self._json(200, res)
+                body = json.loads(self.rfile.read(n) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("body must be a JSON object")
+                return body, True
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+                return None, False
+
+        def do_POST(self):
+            route = urlsplit(self.path).path
+            if route == "/api/save-offset":
+                body, ok = self._read_json()
+                if not ok:
+                    return
+                subj = store.get(body.get("subject"))
+                if subj is None:
+                    return self._json(404, {"ok": False, "error": "unknown subject"})
+                if subj.save_cb is None:
+                    return self._json(403, {"ok": False, "error": "saving is disabled"})
+                try:
+                    res = subj.save_cb(float(body["mp3_offset_sec"]))
+                except (ValueError, KeyError, TypeError) as exc:
+                    return self._json(400, {"ok": False, "error": str(exc)})
+                subj.state["saved_offset"] = res["mp3_offset_sec"]
+                subj.state["default_offset"] = res["mp3_offset_sec"]  # sessions.json now holds this value
+                return self._json(200, res)
+            if live is not None and route.startswith("/api/live/"):
+                body, ok = self._read_json()
+                if not ok:
+                    return
+                try:
+                    if route == "/api/live/clock":
+                        return self._json(200, live.clock_update(body))
+                    if route == "/api/live/start":
+                        res = live.start(camera=body.get("camera"), source=body.get("source", "metronome"),
+                                         song_id=body.get("song_id"), bpm=float(body.get("bpm", 180)),
+                                         mirror=bool(body.get("mirror", True)), height_m=body.get("height_m"),
+                                         camera_latency_ms=body.get("camera_latency_ms"))
+                        return self._json(200, res)
+                    if route == "/api/live/stop":
+                        return self._json(200, live.stop())
+                    if route == "/api/live/count-shift":
+                        return self._json(200, live.count_shift(int(body.get("delta", 1))))
+                    if route == "/api/live/save":
+                        return self._json(200, live.save())
+                except (ValueError, TypeError, KeyError) as exc:
+                    return self._json(400, {"ok": False, "error": str(exc)})
+                except Exception as exc:  # camera / model problems: report them to the page
+                    log.warning("live %s failed: %s", route, exc)
+                    return self._json(500, {"ok": False, "error": str(exc)})
+            return self._not_found()
 
     return Handler
 
 
-def make_server(report: dict[str, Any], media: dict[str, Any], video: Path | None, audio: Path | None,
-                host: str = "127.0.0.1", port: int = 8765,
+def _json_default(o):
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(type(o))
+
+
+def make_server(report: dict[str, Any] | None = None, media: dict[str, Any] | None = None, video: Path | None = None,
+                audio: Path | None = None, host: str = "127.0.0.1", port: int = 8765,
                 save_cb: Callable[[float], dict[str, Any]] | None = None,
-                floor: dict[str, Any] | None = None, default_offset: float = 0.0) -> ThreadingHTTPServer:
+                floor: dict[str, Any] | None = None, default_offset: float = 0.0,
+                store: SubjectStore | None = None, live=None) -> ThreadingHTTPServer:
+    """Single-subject server (``report`` given), or multi-subject (``store``), optionally with the live coach."""
     mimetypes.add_type("audio/mpeg", ".mp3")
     mimetypes.add_type("audio/wav", ".wav")
     mimetypes.add_type("video/mp4", ".mp4")
-    state: dict[str, Any] = {"saved_offset": None, "default_offset": float(default_offset)}
-    handler = make_handler(report, media, {"video": video, "audio": audio}, save_cb, state, floor)
-    return ThreadingHTTPServer((host, port), handler)
+    if store is None:
+        if report is not None:
+            sid = report.get("subject_id") or "subject"
+            store = SubjectStore.single(Subject(sid, report, media or {}, video, audio, floor, default_offset, save_cb))
+        else:
+            store = SubjectStore()
+    srv = ThreadingHTTPServer((host, port), make_handler(store, live))
+    srv.daemon_threads = True  # MJPEG streams must not block shutdown
+    return srv
 
 
 def load_floor(out_dir: Path, report: dict[str, Any], height_m: float) -> dict[str, Any]:
@@ -607,24 +775,53 @@ def load_subject(config: str, subject: str | None, prepare_audio: bool = True):
     return report, media, video, audio, notes, sess["id"], floor
 
 
+def config_store(config: str, default: str | None = None, read_only: bool = False) -> SubjectStore:
+    """Subjects from sessions.json that have an ``epochs_and_steps.json`` (re-read on every listing)."""
+    from main import load_config
+
+    def ids():
+        if not Path(config).is_file():
+            return []
+        cfg = load_config(config)
+        return [s["id"] for s in cfg["sessions"] if (Path(cfg["output_root"]) / s["id"] / "epochs_and_steps.json").is_file()]
+
+    def loader(sid):
+        report, media, video, audio, notes, sid2, floor = load_subject(config, sid)
+        for n in notes:
+            log.warning("[%s] %s", sid2, n)
+        cb = None if read_only else (lambda v, _sid=sid2: save_offset_to_config(config, _sid, v))
+        return Subject(sid2, report, media, video, audio, floor, media.get("default_offset", 0.0), cb)
+
+    first = default or next(iter(ids()), None)
+    return SubjectStore(loader, ids, first)
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Local rhythm / tempo dashboard")
+    ap = argparse.ArgumentParser(description="Local rhythm / tempo dashboard (recorded sessions + live webcam coach)")
     ap.add_argument("--config", default="sessions.json")
-    ap.add_argument("--subject", help="session id (default: first session)")
+    ap.add_argument("--subject", help="session id to open first (default: first session with outputs)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--read-only", action="store_true", help="disable 'Save offset to sessions.json'")
+    ap.add_argument("--live", action="store_true", help="open the Live Webcam Coach page")
+    ap.add_argument("--camera", type=int, default=0, help="default webcam index for live mode")
+    ap.add_argument("--live-model", choices=["lite", "full", "heavy"],
+                    help="pose model for live mode (default: lite/full if present in models/, else heavy)")
+    ap.add_argument("--height", type=float, default=1.70, help="dancer height (m) for the live footwork map")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    report, media, video, audio, notes, sid, floor = load_subject(args.config, args.subject)
-    for n in notes:
-        log.warning(n)
-    save_cb = None if args.read_only else (lambda v: save_offset_to_config(args.config, sid, v))
-    server = make_server(report, media, video, audio, args.host, args.port, save_cb, floor,
-                         media.get("default_offset", 0.0))
-    url = f"http://{args.host}:{server.server_address[1]}/"
-    print(f"Rhythm dashboard for {sid}: {url}  (Ctrl+C to quit)")
+    import realtime
+
+    store = config_store(args.config, args.subject, args.read_only)
+    if args.subject and store.get(args.subject) is None:
+        raise SystemExit(f"Subject '{args.subject}' could not be loaded (see warnings above).")
+    live = realtime.LiveEngine(config_path=args.config if Path(args.config).is_file() else None,
+                               height_m=args.height, camera=args.camera, model=args.live_model)
+    server = make_server(store=store, live=live, host=args.host, port=args.port)
+    base = f"http://{args.host}:{server.server_address[1]}"
+    url = base + ("/live" if args.live or store.get() is None else "/" + (f"?subject={args.subject}" if args.subject else ""))
+    print(f"Rhythm dashboard: {url}  (Recorded Sessions: {base}/ · Live Webcam Coach: {base}/live · Ctrl+C to quit)")
     if not args.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
@@ -632,6 +829,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        server._closing = True
+        live.stop()
         server.server_close()
     return 0
 
@@ -656,6 +855,11 @@ body{margin:0;height:100vh;overflow:hidden;display:grid;grid-template-rows:auto 
   background:var(--bg);color:var(--text);font:13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 header{display:flex;align-items:center;gap:16px;padding:8px 16px;border-bottom:1px solid var(--line);min-width:0}
 header h1{font-size:15px;margin:0;font-weight:650;white-space:nowrap}
+.modes{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:none}
+.modes a{padding:4px 11px;color:var(--muted);text-decoration:none;font-size:12.5px;white-space:nowrap}
+.modes a.on{background:var(--blue);color:#05101f;font-weight:650}
+.modes a:not(.on):hover{color:var(--text);background:var(--panel2)}
+#subjSel{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:3px 6px;font:inherit;max-width:180px}
 header .meta{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
 .legend{display:flex;gap:12px;font-size:12px;color:var(--muted);white-space:nowrap}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px;vertical-align:0}
@@ -738,7 +942,9 @@ tbody tr{cursor:pointer} tbody tr:hover{background:#1b2534} tbody tr.cur{backgro
 </head>
 <body>
 <header>
+  <nav class="modes"><a class="on" href="/">Recorded Sessions</a><a href="/live">Live Webcam Coach</a></nav>
   <h1>Rhythm Dashboard · <span id="subj"></span></h1>
+  <select id="subjSel" title="Recorded session"></select>
   <div class="meta" id="meta"></div>
   <div class="legend">
     <span><i class="dot" style="background:var(--left)"></i>Left foot</span>
@@ -760,7 +966,7 @@ tbody tr{cursor:pointer} tbody tr:hover{background:#1b2534} tbody tr.cur{backgro
       </div>
     </div>
     <div class="stage mode-camera" id="stage">
-      <div class="videowrap"><video id="video" src="media/video" preload="auto" playsinline muted></video></div>
+      <div class="videowrap"><video id="video" preload="auto" playsinline muted></video></div>
       <div class="mapwrap" id="mapwrap">
         <svg id="map"></svg>
         <div class="mapcard" id="mapMetrics"></div>
@@ -838,9 +1044,19 @@ tbody tr{cursor:pointer} tbody tr:hover{background:#1b2534} tbody tr.cur{backgro
 <script>
 (async function(){
 const $ = id => document.getElementById(id);
-let D = await (await fetch('api/data')).json();
+const SUBJ = new URLSearchParams(location.search).get('subject');
+const Q = SUBJ ? 'subject=' + encodeURIComponent(SUBJ) : '';
+const withQ = (u) => Q ? u + (u.includes('?') ? '&' : '?') + Q : u;
+let D = await (await fetch(withQ('api/data'))).json();
+document.getElementById('video').src = withQ('media/video');
+fetch('api/subjects').then(r => r.json()).then(j => {
+  const sel = document.getElementById('subjSel'); const cur = SUBJ || D.subject_id;
+  for (const id of j.subjects){ const o = document.createElement('option'); o.value = id; o.textContent = id; if (id === cur) o.selected = true; sel.appendChild(o); }
+  if (!j.subjects.length) sel.style.display = 'none';
+  sel.onchange = () => { location.href = '/?subject=' + encodeURIComponent(sel.value); };
+}).catch(() => {});
 const video = $('video');
-const audio = D.media.audio ? new Audio('media/audio') : null;
+const audio = D.media.audio ? new Audio(withQ('media/audio')) : null;
 if (audio){ audio.preload = 'auto'; audio.preservesPitch = true; }
 let DEFAULT_OFFSET = D.mp3_offset_default_sec;   // sessions.json override, else 0.0
 let offset = D.mp3_offset_sec;           // current mp3_offset_sec (cam1 time of song t=0)
@@ -1038,7 +1254,7 @@ function setOffset(v, {refetch=true} = {}){
   offset = Math.round(v * 1000) / 1000; $('offset').value = offset.toFixed(3);
   metro.clear(); hardSync();
   if (refetch){ clearTimeout(refetchTimer); refetchTimer = setTimeout(async () => {
-    const r = await fetch('api/data?mp3_offset=' + encodeURIComponent(offset)); if (r.ok){ D = await r.json(); renderAll(); } }, 180); }
+    const r = await fetch(withQ('api/data?mp3_offset=' + encodeURIComponent(offset))); if (r.ok){ D = await r.json(); renderAll(); } }, 180); }
 }
 $('offset').addEventListener('change', e => setOffset(parseFloat(e.target.value)));
 document.querySelectorAll('[data-nudge]').forEach(b => b.addEventListener('click', () => setOffset(offset + (+b.dataset.nudge) / 1000)));
@@ -1055,7 +1271,7 @@ $('tap').onclick = () => {
 };
 $('save').onclick = async () => {
   if (!D.media.can_save){ toast('Saving is disabled (read-only mode).'); return; }
-  const r = await fetch('api/save-offset', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mp3_offset_sec: offset})});
+  const r = await fetch('api/save-offset', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mp3_offset_sec: offset, subject: SUBJ || D.subject_id})});
   const j = await r.json().catch(() => ({}));
   if (r.ok && j.ok){ DEFAULT_OFFSET = j.mp3_offset_sec; }
   if (r.ok && j.ok) toast(`Saved mp3_offset_sec = ${j.mp3_offset_sec} s to ${j.config}. Re-run main.py for this session to re-score the steps and re-render the overlay.`, 8000);
@@ -1319,6 +1535,305 @@ renderAll(); updatePlayBtn(); requestAnimationFrame(frame);
 </html>
 """
 
+
+# --------------------------------------------------------------------------- #
+# Live Webcam Coach page (self-contained)
+# --------------------------------------------------------------------------- #
+LIVE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Webcam Coach</title>
+<style>
+:root{--bg:#0b1018;--panel:#121924;--panel2:#18212f;--line:#243043;--text:#e6edf6;--muted:#8b98ab;
+  --left:#00e5ff;--right:#ff4081;--green:#22c55e;--amber:#f59e0b;--red:#ef4444;--accent:#ffc400;--blue:#60a5fa}
+*{box-sizing:border-box} html,body{height:100%}
+body{margin:0;height:100vh;overflow:hidden;display:grid;grid-template-rows:auto minmax(0,1fr);background:var(--bg);color:var(--text);
+  font:13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:8px 16px;border-bottom:1px solid var(--line);min-width:0}
+header h1{font-size:15px;margin:0;font-weight:650;white-space:nowrap}
+.meta{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+.modes{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:none}
+.modes a{padding:4px 11px;color:var(--muted);text-decoration:none;font-size:12.5px;white-space:nowrap}
+.modes a.on{background:var(--blue);color:#05101f;font-weight:650} .modes a.off{opacity:.45;pointer-events:none}
+.modes a:not(.on):hover{color:var(--text);background:var(--panel2)}
+main{display:grid;grid-template-columns:minmax(0,55fr) minmax(0,45fr);gap:12px;padding:10px 12px 12px;min-height:0}
+.col{display:grid;gap:8px;min-height:0;min-width:0}
+.left{grid-template-rows:auto auto minmax(0,1fr)} .right{grid-template-rows:auto auto minmax(0,1fr)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px 12px;min-height:0;min-width:0}
+.card h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 6px;font-weight:650;display:flex;align-items:center;gap:8px}
+.bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;row-gap:6px}
+.btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:4px 10px;cursor:pointer;font:inherit;white-space:nowrap}
+.btn:hover{border-color:#3b4a61} .btn.on{background:var(--blue);border-color:var(--blue);color:#05101f;font-weight:650}
+.btn.go{background:var(--green);border-color:var(--green);color:#03150a;font-weight:700;min-width:150px}
+.btn.stop{background:var(--red);border-color:var(--red);color:#fff;font-weight:700;min-width:150px}
+.btn:disabled{opacity:.5;cursor:default}
+.seg{display:flex} .seg .btn{border-radius:0;margin-left:-1px} .seg .btn:first-child{border-radius:7px 0 0 7px;margin-left:0} .seg .btn:last-child{border-radius:0 7px 7px 0}
+select,input[type=number]{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:4px 6px;font:inherit}
+input[type=number]{width:66px} input[type=range]{accent-color:var(--accent);width:120px}
+.lbl{color:var(--muted);font-size:12px;white-space:nowrap} .mono{font-variant-numeric:tabular-nums}
+.chk{display:flex;gap:4px;align-items:center;cursor:pointer;white-space:nowrap;color:var(--muted)}
+.spacer{flex:1}
+.stage{position:relative;display:grid;gap:8px;min-height:0;grid-template-columns:1fr}
+.stage.mode-split{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+.stage.mode-camera .mapwrap,.stage.mode-map .camwrap{display:none}
+.camwrap,.mapwrap{position:relative;min-height:0;min-width:0;background:#000;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.mapwrap{background:#0d141f}
+#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+#lmap{position:absolute;inset:0;width:100%;height:100%;display:block}
+.bigcount{font-size:22px;font-weight:800;min-width:110px;text-align:right;font-variant-numeric:tabular-nums}
+.bigcount span{color:var(--accent)}
+.scorerow{display:grid;grid-template-columns:auto minmax(0,1fr);gap:12px;align-items:center}
+.ring{position:relative;width:96px;height:96px} .ring svg{transform:rotate(-90deg)}
+.ring .val{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.ring .val b{font-size:23px;line-height:1} .ring .val span{font-size:10px;color:var(--muted);margin-top:3px;text-transform:uppercase;letter-spacing:.06em}
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.kpi{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 8px;min-width:0}
+.kpi .k{color:var(--muted);font-size:11px;white-space:nowrap} .kpi .v{font-size:18px;font-weight:650;font-variant-numeric:tabular-nums;white-space:nowrap}
+.coach{font-size:16px;font-weight:650;padding:10px 12px;border-radius:8px;border-left:4px solid var(--blue);background:var(--panel2);min-height:46px}
+.coach.ok{border-left-color:var(--green)} .coach.warn{border-left-color:var(--amber)}
+.coachmeta{color:var(--muted);font-size:11.5px;margin-top:5px}
+#logCard{display:grid;grid-template-rows:auto minmax(0,1fr)}
+.tablewrap{overflow:auto;min-height:0;border:1px solid var(--line);border-radius:8px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{padding:5px 9px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-weight:600;font-size:11.5px}
+tbody tr.new{animation:flash 1s ease-out} @keyframes flash{from{background:rgba(255,196,0,.25)}to{background:transparent}}
+.foot-L{color:var(--left);font-weight:650} .foot-R{color:var(--right);font-weight:650}
+.tag{padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:650}
+.c-on_time{background:rgba(34,197,94,.15);color:var(--green)} .c-early,.c-late{background:rgba(245,158,11,.15);color:var(--amber)}
+.c-off_early,.c-off_late{background:rgba(239,68,68,.17);color:var(--red)} .c-none{background:var(--panel2);color:var(--muted)}
+.err{color:var(--red);font-size:12px} .ok{color:var(--green)}
+.toast{position:fixed;right:16px;bottom:16px;background:#0b1220;border:1px solid #334155;border-radius:8px;padding:9px 12px;display:none;max-width:460px;z-index:10;font-size:12.5px}
+.toast a{color:var(--accent)}
+</style>
+</head>
+<body>
+<header>
+  <nav class="modes"><a id="recLink" href="/">Recorded Sessions</a><a class="on" href="/live">Live Webcam Coach</a></nav>
+  <h1>Live Webcam Coach</h1>
+  <div class="meta mono" id="meta">idle</div>
+  <span class="lbl"><span style="color:var(--left)">■</span> left · <span style="color:var(--right)">■</span> right · ±45 ms on time</span>
+</header>
+<main>
+  <div class="col left">
+    <div class="card bar">
+      <span class="lbl">Camera</span><select id="camSel"></select><button class="btn" id="camRefresh" title="Re-scan cameras">↻</button>
+      <label class="chk"><input type="checkbox" id="mirror" checked>Mirror</label>
+      <span class="lbl">Music</span><select id="srcSel"><option value="metronome">Built-in salsa clave / cowbell</option></select>
+      <span class="lbl">BPM</span><input type="range" id="bpm" min="120" max="200" step="1" value="180"><b class="mono" id="bpmVal">180</b>
+      <span class="lbl">Height</span><input type="number" id="height" min="1.2" max="2.2" step="0.01" value="1.70"><span class="lbl">m</span>
+      <span class="lbl" title="Webcam capture delay compensation">Cam latency</span><input type="number" id="camLat" min="0" max="400" step="10" value="60"><span class="lbl">ms</span>
+      <span class="spacer"></span>
+      <button class="btn" id="countShift" title="Move the 8-count by one beat (if the 1 is on the wrong beat)">Count +1</button>
+      <button class="btn go" id="startBtn">▶ Start Live Session</button>
+    </div>
+    <div class="bar">
+      <div class="seg" id="views"><button class="btn on" data-view="camera">Live Camera + Skeleton</button><button class="btn" data-view="map">Live Top-Down Footwork Map</button><button class="btn" data-view="split">Split View</button></div>
+      <span class="spacer"></span><span class="err" id="errLine"></span>
+      <div class="bigcount" id="bigCount">Beat <span>–</span></div>
+    </div>
+    <div class="stage mode-camera" id="stage">
+      <div class="camwrap"><img id="cam" alt="live camera" src="/api/live/stream?once=1"></div>
+      <div class="mapwrap"><svg id="lmap"></svg></div>
+    </div>
+  </div>
+  <div class="col right">
+    <div class="card">
+      <div class="scorerow">
+        <div class="ring"><svg width="96" height="96" viewBox="0 0 96 96"><circle cx="48" cy="48" r="41" fill="none" stroke="#243043" stroke-width="8"/>
+          <circle id="arc" cx="48" cy="48" r="41" fill="none" stroke="#22c55e" stroke-width="8" stroke-linecap="round" stroke-dasharray="0 999"/></svg>
+          <div class="val"><b id="score">–</b><span>Tempo</span></div></div>
+        <div class="kpis" id="kpis"></div>
+      </div>
+    </div>
+    <div class="card"><h2>Coaching diagnosis <span class="lbl" style="text-transform:none;letter-spacing:0">updates every 2 bars</span></h2>
+      <div class="coach" id="coach">Press Start and begin your basic step.</div><div class="coachmeta" id="coachMeta"></div></div>
+    <div class="card" id="logCard">
+      <h2>Step &amp; error log <span class="spacer"></span><span class="lbl" id="saveInfo" style="text-transform:none;letter-spacing:0"></span>
+        <button class="btn" id="saveBtn" title="Export video, steps.csv and epochs_and_steps.json to outputs/live_<timestamp>/">Save Session</button></h2>
+      <div class="tablewrap"><table><thead><tr><th>Time (s)</th><th>Foot</th><th>Beat</th><th>Error (ms)</th><th>Status</th></tr></thead><tbody id="tbody"></tbody></table></div>
+    </div>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+(function(){
+const $ = id => document.getElementById(id);
+const fmt = (v, d=0) => (v == null || Number.isNaN(v)) ? '–' : Number(v).toFixed(d);
+const sgn = (v, d=0) => v == null ? '–' : (v > 0 ? '+' : '') + Number(v).toFixed(d);
+function toast(html, ms=6000){ const t = $('toast'); t.innerHTML = ''; t.append(...(html instanceof Node ? [html] : [document.createTextNode(html)])); t.style.display = 'block'; clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = 'none', ms); }
+async function post(url, body){ const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {})}); const j = await r.json().catch(() => ({})); if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status)); return j; }
+
+// ---------- catalogue ----------
+async function loadCameras(refresh){
+  const j = await (await fetch('/api/live/cameras' + (refresh ? '?refresh=1' : ''))).json(); const sel = $('camSel'), cur = sel.value; sel.innerHTML = '';
+  for (const c of j.cameras){ const o = document.createElement('option'); o.value = c.index; o.textContent = c.name + (c.width ? ` (${c.width}×${c.height})` : ''); sel.appendChild(o); }
+  if (cur !== '') sel.value = cur;
+}
+async function loadSongs(){
+  const j = await (await fetch('/api/live/songs')).json();
+  for (const s of j.songs){ const o = document.createElement('option'); o.value = 'song:' + s.id; o.textContent = '♫ ' + s.name; $('srcSel').appendChild(o); }
+}
+fetch('/api/subjects').then(r => r.json()).then(j => { if (!j.subjects.length) $('recLink').classList.add('off'); }).catch(() => {});
+loadCameras(false); loadSongs();
+$('camRefresh').onclick = () => loadCameras(true);
+$('bpm').oninput = () => { $('bpmVal').textContent = $('bpm').value; if (running && metro) restartMetronome(); };
+$('srcSel').onchange = () => { $('bpm').disabled = $('srcSel').value !== 'metronome'; };
+
+// ---------- audio: browser is the master beat clock ----------
+let ctx = null, metro = null, audio = null, running = false, hb = null;
+function outLatency(){ return ctx ? (ctx.outputLatency || ctx.baseLatency || 0) : 0; }
+function tone(when, freq, dur, gain, type){ const o = ctx.createOscillator(), g = ctx.createGain(); o.type = type; o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, when); g.gain.exponentialRampToValueAtTime(gain, when + 0.002); g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+  o.connect(g).connect(ctx.destination); o.start(when); o.stop(when + dur + 0.02); }
+function cowbell(when, accent){ tone(when, 587, 0.09, accent ? 0.22 : 0.13, 'square'); tone(when, 845, 0.09, accent ? 0.18 : 0.1, 'square'); }
+function clave(when){ tone(when, 2500, 0.05, 0.35, 'sine'); }
+const CLAVE = [0, 1.5, 3, 5, 6];  // son clave 3-2 over the 8-count (beats 1, 2&, 4 | 6, 7)
+function startMetronome(){
+  const period = 60 / +$('bpm').value;
+  metro = {t0: ctx.currentTime + 0.15, period, k: 0, bpm: +$('bpm').value};
+  metro.timer = setInterval(() => {
+    while (metro && metro.t0 + metro.k * metro.period < ctx.currentTime + 0.15){
+      const k = metro.k, when = metro.t0 + k * metro.period, pos = k % 8;
+      cowbell(when, pos === 0);
+      for (const c of CLAVE) if (Math.floor(c) === pos) clave(when + (c - pos) * metro.period);
+      metro.k++;
+    }
+  }, 25);
+}
+function stopMetronome(){ if (metro){ clearInterval(metro.timer); metro = null; } }
+function restartMetronome(){ stopMetronome(); startMetronome(); heartbeat(); }
+function heartbeat(){
+  let body;
+  if (metro) body = {source:'metronome', bpm: metro.bpm, playing: true, audio_time: ctx.currentTime - metro.t0 - outLatency()};
+  else if (audio) body = {source:'song', playing: !audio.paused && !audio.ended, audio_time: audio.currentTime - outLatency()};
+  else body = {playing: false};
+  post('/api/live/clock', body).catch(() => {});
+}
+
+// ---------- start / stop ----------
+async function start(){
+  $('startBtn').disabled = true; $('errLine').textContent = '';
+  const src = $('srcSel').value, isSong = src.startsWith('song:');
+  try {
+    ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();  // created inside the click (audio unlock)
+    await ctx.resume();
+    if (isSong){ audio = new Audio('/api/live/song?id=' + src.slice(5)); audio.preload = 'auto'; }
+    await post('/api/live/start', {camera: +$('camSel').value || 0, source: isSong ? 'song' : 'metronome', song_id: isSong ? +src.slice(5) : null,
+      bpm: +$('bpm').value, mirror: $('mirror').checked, height_m: +$('height').value, camera_latency_ms: +$('camLat').value});
+    if (isSong){ await audio.play(); audio.onpause = audio.onplay = audio.onseeked = heartbeat; } else startMetronome();
+    running = true; heartbeat(); hb = setInterval(heartbeat, 200);
+    $('cam').src = '/api/live/stream?t=' + Date.now();
+  } catch (e){
+    stopAudio(); $('errLine').textContent = e.message; toast('Could not start: ' + e.message);
+  } finally { $('startBtn').disabled = false; updateButton(); }
+}
+function stopAudio(){ stopMetronome(); if (audio){ audio.pause(); audio = null; } }
+async function stop(){
+  stopAudio(); clearInterval(hb); hb = null; running = false; heartbeat();
+  try { await post('/api/live/stop'); } catch (e){ toast(e.message); }
+  updateButton();
+}
+function updateButton(){ const b = $('startBtn'); b.textContent = running ? '■ Stop Live Session' : '▶ Start Live Session'; b.className = 'btn ' + (running ? 'stop' : 'go'); }
+$('startBtn').onclick = () => running ? stop() : start();
+$('countShift').onclick = () => post('/api/live/count-shift', {delta: 1}).catch(e => toast(e.message));
+$('saveBtn').onclick = async () => {
+  $('saveBtn').disabled = true;
+  try {
+    if (running) await stop();
+    const j = await post('/api/live/save');
+    const span = document.createElement('span'); span.textContent = `Saved ${j.n_steps} steps (${fmt(j.duration_s,1)} s) to ${j.dir}. `;
+    if (j.url){ const a = document.createElement('a'); a.href = j.url; a.textContent = 'Open in Recorded Sessions →'; span.appendChild(a); }
+    toast(span, 12000); $('recLink').classList.remove('off');
+  } catch (e){ toast('Save failed: ' + e.message); } finally { $('saveBtn').disabled = false; }
+};
+document.querySelectorAll('[data-view]').forEach(b => b.onclick = () => {
+  $('stage').className = 'stage mode-' + b.dataset.view; document.querySelectorAll('[data-view]').forEach(x => x.classList.toggle('on', x === b)); lastFloorKey = ''; });
+
+// ---------- live state ----------
+const COL = {on_time:'#22c55e', early:'#f59e0b', late:'#f59e0b', off_early:'#ef4444', off_late:'#ef4444', none:'#64748b'};
+let lastTop = -1, lastFloorKey = '';
+async function poll(){
+  let S; try { S = await (await fetch('/api/live/state')).json(); } catch (e){ return; }
+  if (S.running !== running && !S.running && running){ running = false; stopAudio(); clearInterval(hb); updateButton(); }
+  const c = S.clock || {};
+  $('meta').textContent = `${S.running ? '● live' : 'idle'} · ${fmt(S.fps,1)} fps · latency ${S.latency_ms == null ? '–' : S.latency_ms + ' ms'} · model ${S.model || '–'} · ` +
+    `music ${c.playing ? 'synced' : 'not playing'}${c.jitter_ms != null ? ' (±' + fmt(c.jitter_ms,1) + ' ms)' : ''}` + (S.grid ? ` · ${fmt(S.grid.bpm,1)} BPM` : '') + (S.status && S.status !== 'running' ? ' · ' + S.status : '');
+  if (S.error) $('errLine').textContent = S.error;
+  $('bigCount').innerHTML = ''; $('bigCount').append('Beat ', Object.assign(document.createElement('span'), {textContent: S.count == null ? '–' : ([4,8].includes(S.count) ? '[' + S.count + ']' : S.count)}));
+  const st = S.stats || {};
+  const sc = st.tempo_score; $('score').textContent = sc == null ? '–' : Math.round(sc) + '%';
+  const C = 2 * Math.PI * 41, col = sc == null ? '#64748b' : sc >= 85 ? '#22c55e' : sc >= 70 ? '#60a5fa' : sc >= 50 ? '#f59e0b' : '#ef4444';
+  $('arc').setAttribute('stroke-dasharray', `${C * (sc || 0) / 100} ${C}`); $('arc').setAttribute('stroke', col);
+  const kp = [['On-tempo', st.on_tempo_pct == null ? '–' : fmt(st.on_tempo_pct,0) + '%'], ['Mean offset', st.mean_offset_ms == null ? '–' : sgn(st.mean_offset_ms,0) + ' ms'],
+              ['QQS accuracy', st.qqs_accuracy_pct == null ? '–' : fmt(st.qqs_accuracy_pct,0) + '%'], ['Steps', st.n_steps == null ? '–' : st.n_steps]];
+  $('kpis').innerHTML = ''; for (const [k, v] of kp){ const d = document.createElement('div'); d.className = 'kpi';
+    d.append(Object.assign(document.createElement('div'), {className:'k', textContent:k}), Object.assign(document.createElement('div'), {className:'v', textContent:v})); $('kpis').appendChild(d); }
+  if (S.coach){ $('coach').textContent = S.coach.text; $('coach').className = 'coach ' + (S.coach.kind || ''); $('coachMeta').textContent = S.coach.bar ? `bar ${S.coach.bar} · ${fmt(S.coach.updated_at,1)} s` : ''; }
+  const steps = S.steps || [];
+  if ((steps[0] ? steps[0].i : -1) !== lastTop){
+    const tb = $('tbody'); tb.innerHTML = '';
+    for (const s of steps){ const tr = document.createElement('tr'); if (s.i > lastTop && lastTop >= 0) tr.className = 'new';
+      const cells = [fmt(s.t,2), s.foot, s.beat == null ? '–' : ([4,8].includes(s.beat) ? '[' + s.beat + ']' : s.beat), s.offset_ms == null ? '–' : sgn(s.offset_ms,0), ''];
+      cells.forEach((v, j) => { const td = document.createElement('td'); td.textContent = v; if (j === 1) td.className = 'foot-' + s.foot; tr.appendChild(td); });
+      tr.children[4].appendChild(Object.assign(document.createElement('span'), {className:'tag c-' + s.category, textContent: s.status}));
+      tb.appendChild(tr); }
+    lastTop = steps[0] ? steps[0].i : -1;
+  }
+  if (S.last_saved && S.last_saved.url) $('saveInfo').textContent = 'last saved: ' + S.last_saved.subject_id;
+  if (!$('stage').classList.contains('mode-camera')) drawMap(S.floor);
+}
+setInterval(poll, 150); poll();
+
+// ---------- live top-down footwork map ----------
+const NS = 'http://www.w3.org/2000/svg', svg = $('lmap');
+const SOLE = [[0,-.5],[.12,-.47],[.16,-.36],[.14,-.12],[.19,.12],[.2,.3],[.15,.44],[.06,.5],[-.05,.49],[-.14,.42],[-.18,.26],[-.17,.06],[-.13,-.14],[-.15,-.35],[-.11,-.47]];
+function el(tag, a, parent = svg){ const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); parent.appendChild(e); return e; }
+function txt(x, y, s, a = {}){ const t = el('text', Object.assign({x, y, fill:'#cbd5e1', 'font-size':11, 'text-anchor':'middle'}, a)); t.textContent = s; return t; }
+function drawMap(F){
+  const W = svg.clientWidth, H = svg.clientHeight; if (!F || W < 40 || H < 40) return;
+  const key = JSON.stringify([F.steps.length && F.steps[F.steps.length - 1].i, F.cycle, F.live, W, H]); if (key === lastFloorKey) return; lastFloorKey = key;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`); svg.innerHTML = '';
+  const id = F.ideal, [ax, ay] = F.anchor, r = Math.max(60, id.reach_cm + 30), x0 = ax - r, x1 = ax + r, y0 = ay - r, y1 = ay + r;
+  const k = Math.min((W - 40) / (x1 - x0), (H - 54) / (y1 - y0)), cx = W / 2, cy = H / 2 + 8;
+  const P = (x, y) => [cx + (x - ax) * k, cy - (y - ay) * k];
+  for (let v = Math.ceil(x0 / 10) * 10; v <= x1; v += 10){ const [a] = P(v, 0); el('line', {x1:a, x2:a, y1:P(0, y1)[1], y2:P(0, y0)[1], stroke: v % 50 === 0 ? '#2a3a52' : '#172131'}); }
+  for (let v = Math.ceil(y0 / 10) * 10; v <= y1; v += 10){ const [, b] = P(0, v); el('line', {y1:b, y2:b, x1:P(x0, 0)[0], x2:P(x1, 0)[0], stroke: v % 50 === 0 ? '#2a3a52' : '#172131'}); }
+  const [fx, fy] = P(ax, y1); el('path', {d:`M${fx} ${fy - 6} l-7 11 h14 z`, fill:'#e2e8f0'}); txt(fx, fy + 18, 'FRONT / FACING', {fill:'#e2e8f0', 'font-size':10.5, 'font-weight':700});
+  const foot = (x, y, f, Lf) => { const mir = f === 'L' ? 1 : -1; return SOLE.map(([u, v]) => P(x + u * mir * Lf, y + v * Lf).join(',')).join(' '); };
+  const hs = id.half_stance_cm, R = id.reach_cm, flip = id.one_foot === 'R' ? -1 : 1, Lf = id.foot_length_cm;
+  const ideal = [['L', -hs, 0, '3 · 6'], ['R', hs, 0, '2 · 7'], ['L', -hs, R, '1'], ['R', hs, -R, '5']];
+  for (const [f0, x, y, lab] of ideal){ const f = flip === 1 ? f0 : (f0 === 'L' ? 'R' : 'L'), c = f === 'L' ? '#00e5ff' : '#ff4081';
+    el('polygon', {points: foot(ax + x * flip, ay + y * flip, f, Lf), fill:'none', stroke:c, 'stroke-opacity':.55, 'stroke-width':1.6, 'stroke-dasharray':'4 3'});
+    const [lx, ly] = P(ax + x * flip + (x * flip < 0 ? -1 : 1) * (Lf * .38 + 6), ay + y * flip); txt(lx, ly + 4, lab, {fill:c, 'font-weight':700, 'font-size':12}); }
+  for (const s of F.steps){
+    if (s.x == null) continue;
+    const c = s.foot === 'L' ? '#00e5ff' : '#ff4081', faint = s.age_cycles > 0, pts = foot(s.x, s.y, s.foot, Lf);
+    const g = el('g', {opacity: faint ? (s.age_cycles === 1 ? .3 : .16) : 1});
+    if (!faint){
+      if (s.target_x != null){ const [a, b] = P(s.x, s.y), [tx, ty] = P(s.target_x, s.target_y);
+        el('line', {x1:a, y1:b, x2:tx, y2:ty, stroke:'#94a3b8', 'stroke-dasharray':'2 3'}, g);
+      }
+      el('polygon', {points: pts, fill:'none', stroke: COL[s.category] || '#64748b', 'stroke-width':6, 'stroke-linejoin':'round'}, g);
+    }
+    el('polygon', {points: pts, fill:c, 'fill-opacity': faint ? .3 : .85, stroke:'#0b1220', 'stroke-width':1}, g);
+    if (!faint && s.beat){ const [a, b] = P(s.x, s.y); const t = el('text', {x:a, y:b + 4, fill:'#0b1220', 'font-size':11, 'font-weight':800, 'text-anchor':'middle'}, g); t.textContent = s.beat; }
+  }
+  // error distance labels (drawn on top)
+  for (const s of F.steps){ if (s.age_cycles || s.target_x == null || s.err_cm < 3) continue; const [a, b] = P(s.x, s.y), [tx, ty] = P(s.target_x, s.target_y);
+    txt((a + tx) / 2 + 13, (b + ty) / 2, s.err_cm.toFixed(0) + ' cm', {fill:'#e2e8f0', 'font-size':10, 'font-weight':600}); }
+  if (F.live) for (const f of ['L', 'R']){ const q = F.live[f]; if (!q) continue; const [a, b] = P(q[0], q[1]);
+    el('circle', {cx:a, cy:b, r:7, fill: f === 'L' ? '#00e5ff' : '#ff4081', stroke:'#0b1220', 'stroke-width':2, opacity:.95}); }
+  txt(14, H - 10, 'cycle ' + (F.cycle + 1) + ' · dashed = ideal On-1 basic', {fill:'#64748b', 'font-size':10, 'text-anchor':'start'});
+}
+updateButton();
+})();
+</script>
+</body>
+</html>
+"""
 
 if __name__ == "__main__":
     raise SystemExit(main())

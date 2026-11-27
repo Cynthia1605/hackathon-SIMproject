@@ -290,6 +290,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     rows = []
     for sess in sessions:
+        if sess.get("live"):
+            # saved Live Webcam Coach sessions are single-camera and already analysed: nothing to batch-process
+            log.info("[%s] live session (already analysed by the webcam coach) - skipped", sess["id"])
+            continue
         try:
             rows.append(run_session(sess, cfg, args.force_pose, not args.no_overlay))
         except Exception as exc:  # keep going with the other subjects
