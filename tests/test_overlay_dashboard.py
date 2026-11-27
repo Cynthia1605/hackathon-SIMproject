@@ -567,10 +567,189 @@ def test_load_subject_prepares_wav_and_falls_back_to_original_video(tmp_path):
     cfg = {"sessions": [{"id": "s1", "cam1": "data/cam1.mp4", "cam2": "data/cam2.mp4", "song_mp3": "data/song.mp3",
                          "height_meters": 1.7}]}
     (tmp_path / "sessions.json").write_text(json.dumps(cfg))
-    report, media, video, audio, notes, sid = DB.load_subject(str(tmp_path / "sessions.json"), "s1")
+    report, media, video, audio, notes, sid, floor = DB.load_subject(str(tmp_path / "sessions.json"), "s1")
     assert sid == "s1" and video == tmp_path / "data" / "cam1.mp4" and not media["video_is_overlay"]
     assert any("overlay_video.py" in n for n in notes)
+    assert floor["available"] is False and any("Footwork map unavailable" in n for n in notes)  # no points3d.npz
     if ffmpeg:
         assert audio == out / "song_sync.wav" and audio.read_bytes()[:4] == b"RIFF" and media["audio_format"] == "wav"
     with pytest.raises(SystemExit):
         DB.load_subject(str(tmp_path / "sessions.json"), "nope")
+
+
+
+# =========================================================================== #
+# Top-down footwork reconstruction (footwork.py + dashboard floor map)
+# =========================================================================== #
+import footwork as FW  # noqa: E402
+
+
+def make_floor_dancer(yaw_deg=35.0, origin=(1.2, -0.4), height=1.70, back_scale=1.0, drift_cm=(0.0, 0.0),
+                      cycles=4, fps=30.0, toes=True, offsets_fn=lambda i, b, f: 0.0):
+    """Synthetic metric 3D feet doing the ideal On-1 basic, facing ``yaw`` in an arbitrary room position.
+
+    Returns (points3d, cam1_frames, fps, report). The world frame has floor Y = 0. A drifting
+    dancer closes each cycle (beats 6 and 7) at a centre shifted by ``drift_cm`` (right, forward),
+    which becomes the next cycle's stance.
+    """
+    geo = FW.ideal_geometry(height)
+    a = np.radians(yaw_deg)
+    f = np.array([np.sin(a), np.cos(a)])  # facing (X, Z)
+    r = np.array([-f[1], f[0]])  # dancer's right
+    o = np.asarray(origin, dtype=float)
+    to_world = lambda x_cm, y_cm: o + (x_cm * r + y_cm * f) / 100.0  # noqa: E731
+    beat_frames = 10
+    n = int(fps) + cycles * 8 * beat_frames + 30
+    hs, R = geo["half_stance_cm"], geo["reach_cm"]
+    pos = {"L": np.zeros((n, 2)), "R": np.zeros((n, 2))}
+    cur = {"L": np.array([-hs, 0.0]), "R": np.array([hs, 0.0])}
+    events, steps = [], []
+    anchor = np.zeros(2)
+    frame = int(fps)
+    plan = {1: ("L", (-hs, R)), 2: ("R", (hs, 0)), 3: ("L", (-hs, 0)), 5: ("R", (hs, -R * back_scale)),
+            6: ("L", (-hs, 0)), 7: ("R", (hs, 0))}
+    for c in range(cycles):
+        for b in range(1, 9):
+            if b == 6:
+                anchor = anchor + np.asarray(drift_cm, dtype=float)
+            if b in plan:
+                foot, (x, y) = plan[b]
+                events.append((frame, foot, anchor + np.array([x, y])))
+                i = len(steps)
+                off = offsets_fn(i, b, foot)
+                steps.append({"epoch_id": 0, "idx": frame, "cam1_frame": frame, "timestamp_sec": frame / fps,
+                              "foot": foot, "beat_count": b, "timing_type": "SLOW" if b in (3, 7) else "QUICK",
+                              "beat_offset_ms": off, "label": f"{foot}{b}", "nearest_music_beat_sec": frame / fps})
+            frame += beat_frames
+    ev = sorted(events, key=lambda e: e[0])
+    k = 0
+    for t in range(n):
+        while k < len(ev) and ev[k][0] <= t:
+            cur[ev[k][1]] = ev[k][2]
+            k += 1
+        pos["L"][t], pos["R"][t] = cur["L"], cur["R"]
+    pts = np.full((n, 33, 3), np.nan)
+    for foot, (ank, heel, toe) in {"L": (27, 29, 31), "R": (28, 30, 32)}.items():
+        w = np.array([to_world(*p) for p in pos[foot]])  # (n, 2) X, Z
+        for j, d, y in ((heel, -0.10, 0.0), (toe, 0.14, 0.0), (ank, -0.04, 0.08)):
+            pts[:, j, 0] = w[:, 0] + d * f[0]
+            pts[:, j, 2] = w[:, 1] + d * f[1]
+            pts[:, j, 1] = y
+        if not toes:
+            pts[:, toe] = np.nan
+            pts[:, heel] = np.nan
+    report = {"steps": steps,
+              "epochs": [{"epoch_id": 0, "start_idx": int(fps) - 5, "end_idx": n, "start_sec": (fps - 5) / fps,
+                          "end_sec": n / fps}]}
+    return pts, np.arange(n), fps, report, geo
+
+
+def test_ideal_geometry_scales_with_height():
+    g = FW.ideal_geometry(1.70)
+    assert 25 <= g["reach_cm"] <= 30 and g["half_stance_cm"] == pytest.approx(9.35, abs=0.1)
+    assert g["targets"][1] == ("L", -g["half_stance_cm"], g["reach_cm"])
+    assert g["targets"][5][0] == "R" and g["targets"][5][2] == -g["reach_cm"]
+    assert FW.ideal_geometry(1.55)["reach_cm"] < FW.ideal_geometry(1.85)["reach_cm"]
+
+
+@pytest.mark.parametrize("yaw", [0.0, 35.0, -120.0, 180.0])
+def test_floor_normalisation_faces_front(yaw):
+    pts, frames, fps, rep, geo = make_floor_dancer(yaw_deg=yaw)
+    fw = FW.compute_footwork(pts, frames, fps, rep, 1.70)
+    assert fw["available"] and fw["method"] == ["foot_facing"]
+    st = {(rep["steps"][f["i"]]["beat_count"]): f for f in fw["steps"][:6]}
+    hs, R = geo["half_stance_cm"], geo["reach_cm"]
+    assert st[1]["x"] == pytest.approx(-hs, abs=0.5) and st[1]["y"] == pytest.approx(R, abs=0.5)  # left fwd, on the left
+    assert st[5]["x"] == pytest.approx(hs, abs=0.5) and st[5]["y"] == pytest.approx(-R, abs=0.5)  # right back
+    assert st[3]["y"] == pytest.approx(0, abs=0.5) and abs(st[1]["heading_deg"]) < 1
+    # live track is in the same frame
+    i = int(np.searchsorted(fw["track"]["t"], 0.5))
+    assert fw["track"]["L"][i] == pytest.approx([-hs, 0.0], abs=0.6)
+
+
+def test_floor_normalisation_pca_fallback_without_toes():
+    pts, frames, fps, rep, geo = make_floor_dancer(yaw_deg=70.0, toes=False)
+    fw = FW.compute_footwork(pts, frames, fps, rep, 1.70)
+    assert fw["method"] == ["pca"]
+    b1 = next(f for f in fw["steps"] if rep["steps"][f["i"]]["beat_count"] == 1)
+    b5 = next(f for f in fw["steps"] if rep["steps"][f["i"]]["beat_count"] == 5)
+    assert b1["y"] > 20 and b5["y"] < -20  # sign fixed by the beat-1 step
+
+
+def test_ideal_dancer_spatial_metrics():
+    pts, frames, fps, rep, geo = make_floor_dancer()
+    m = FW.compute_footwork(pts, frames, fps, rep, 1.70)["metrics"]
+    R = geo["reach_cm"]
+    assert m["placement_err_cm"] < 0.5 and all(v < 0.5 for v in m["placement_err_by_beat_cm"].values())
+    assert m["fwd_reach_cm"] == pytest.approx(R, abs=0.5) and m["back_reach_cm"] == pytest.approx(R, abs=0.5)
+    assert m["fwd_back_symmetry_pct"] == pytest.approx(100, abs=1)
+    assert m["big_step_len_L_cm"] == pytest.approx(R, abs=0.5) and m["big_step_len_R_cm"] == pytest.approx(R, abs=0.5)
+    assert m["step_len_L_cm"] < R and m["step_len_R_cm"] < R  # replace steps (beats 2/6) move ~0 cm
+    assert all(d["dist_cm"] < 0.5 for d in m["drift"])
+    notes = FW.spatial_notes(m)
+    assert len(notes) == 1 and notes[0]["kind"] == "ok" and "balanced" in notes[0]["text"]
+
+
+def test_short_backward_step_metrics_and_note():
+    pts, frames, fps, rep, geo = make_floor_dancer(back_scale=0.55)
+    fw = FW.compute_footwork(pts, frames, fps, rep, 1.70)
+    m, R = fw["metrics"], geo["reach_cm"]
+    assert m["back_reach_cm"] == pytest.approx(0.55 * R, abs=0.5)
+    assert m["fwd_back_symmetry_pct"] == pytest.approx(55, abs=1.5)
+    assert m["placement_err_by_beat_cm"][5] == pytest.approx(0.45 * R, abs=0.5)
+    assert m["placement_err_by_beat_cm"][1] < 0.5
+    b5 = next(f for f in fw["steps"] if rep["steps"][f["i"]]["beat_count"] == 5)
+    assert b5["err_cm"] == pytest.approx(0.45 * R, abs=0.5)
+    assert (b5["target_x"], b5["target_y"]) == pytest.approx((geo["half_stance_cm"], -R), abs=0.5)
+    texts = " ".join(n["text"] for n in FW.spatial_notes(m))
+    assert f"Right backward step (beat 5) is {0.45 * R:.0f} cm shorter than left forward step (beat 1)" in texts
+
+
+def test_drift_detected_and_not_counted_as_placement_error():
+    pts, frames, fps, rep, geo = make_floor_dancer(drift_cm=(-7.0, 0.0), cycles=5)
+    m = FW.compute_footwork(pts, frames, fps, rep, 1.70)["metrics"]
+    d = m["drift"][0]
+    assert d["bars"] == 4 and d["dx_cm"] == pytest.approx(-28, abs=1) and abs(d["dy_cm"]) < 1
+    # beats 1-5 sit on their cycle's ideal pattern; only the drifting closing steps (6, 7) are off by ~7 cm
+    assert all(m["placement_err_by_beat_cm"][b] < 0.5 for b in (1, 2, 3, 5))
+    assert m["placement_err_by_beat_cm"][6] == pytest.approx(7, abs=0.5) and m["placement_err_cm"] < 3
+    texts = " ".join(n["text"] for n in FW.spatial_notes(m))
+    assert "drifts 28 cm left over 4 bars" in texts
+
+
+def test_assign_cycles():
+    steps = [{"beat_count": b, "epoch_id": e} for b, e in
+             [(1, 0), (2, 0), (3, 0), (5, 0), (6, 0), (7, 0), (1, 0), (2, 0), (None, 0), (3, 0), (1, 1), (5, 1)]]
+    assert FW.assign_cycles(steps) == [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2]
+
+
+def test_dashboard_floor_data_and_spatial_coaching():
+    pts, frames, fps, rep, geo = make_floor_dancer(back_scale=0.55)
+    full = make_report()  # timing data for the dashboard
+    rep2 = dict(full, steps=rep["steps"], epochs=[dict(full["epochs"][0], **rep["epochs"][0])])
+    floor = FW.compute_footwork(pts, frames, fps, rep2, 1.70)
+    d = DB.build_dashboard_data(rep2, floor=floor)
+    assert d["floor"]["available"] and len(d["floor"]["ideal"]["targets"]) == 6
+    s5 = next(s for s in d["steps"] if s["beat"] == 5)
+    assert s5["floor"]["err_cm"] == pytest.approx(0.45 * geo["reach_cm"], abs=0.5)
+    texts = [n["text"] for n in d["coaching"]]
+    assert any("backward step (beat 5)" in t for t in texts[:3])  # spatial bullet near the top
+    json.dumps(d)
+    assert DB.build_dashboard_data(rep2)["floor"]["available"] is False
+
+
+def test_page_has_footwork_map_controls():
+    html = DB.INDEX_HTML
+    for sname in ("Camera + Skeleton", "Top-Down Footwork Map", "Split View", "Current 8-Count Cycle",
+                  "All Steps Overlay", "FRONT / FACING", "Position offset", "Fwd / back symmetry"):
+        assert sname in html, sname
+
+
+def test_load_floor_from_points3d(tmp_path):
+    pts, frames, fps, rep, geo = make_floor_dancer()
+    np.savez_compressed(tmp_path / "points3d.npz", points3d=pts.astype(np.float32), cam1_frames=frames, fps=fps)
+    fl = DB.load_floor(tmp_path, rep, 1.70)
+    assert fl["available"] and fl["metrics"]["placement_err_cm"] < 0.5
+    (tmp_path / "points3d.npz").unlink()
+    assert DB.load_floor(tmp_path, dict(rep, footwork=fl), 1.70) is not None  # falls back to the report
+    assert DB.load_floor(tmp_path, rep, 1.70)["available"] is False

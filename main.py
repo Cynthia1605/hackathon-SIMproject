@@ -147,6 +147,17 @@ def analyze_subject(
              ", ".join(f"{e.start_sec:.1f}-{e.end_sec:.1f}s" for e in epochs))
     rhythm = salsa_rhythm.analyze_rhythm(pts_f, fps, cam1_frames, epochs, music, params["rhythm"])
 
+    import footwork
+
+    step_dicts = [st.to_dict() for st in rhythm.steps]
+    fw = footwork.compute_footwork(pts_f, cam1_frames, fps, {"steps": step_dicts, "epochs": [e.to_dict() for e in epochs]},
+                                   height_m)
+    if fw.get("available"):
+        order = sorted(range(len(step_dicts)), key=lambda k: step_dicts[k]["timestamp_sec"])
+        for f in fw["steps"]:
+            sd = step_dicts[order[f["i"]]]
+            sd.update(floor_x_cm=f["x"], floor_y_cm=f["y"], placement_err_cm=f["err_cm"], floor_cycle=f["cycle"])
+
     with open(out_dir / "steps.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
         w.writeheader()
@@ -175,7 +186,9 @@ def analyze_subject(
             {**e.to_dict(), "summary": next((x for x in rhythm.epoch_summaries if x["epoch_id"] == e.epoch_id), {})}
             for e in epochs
         ],
-        "steps": [s.to_dict() for s in rhythm.steps],
+        "steps": step_dicts,
+        # top-down footwork (cm, per-block floor frame: +y = facing, +x = dancer's right)
+        "footwork": fw,
         # beat grid actually used for scoring (tempo-octave corrected), cam1 timeline
         "beat_grid_sec": np.asarray(rhythm.beat_grid_sec, dtype=np.float64).tolist(),
         "summary": rhythm.summary,

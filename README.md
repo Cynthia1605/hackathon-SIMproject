@@ -137,6 +137,21 @@ It opens `http://127.0.0.1:8765/`. Options: `--port`, `--no-browser`, and `--rea
   - Clicking a step replays from **1 s before** it.
 - **Step log.** `All steps` / `Errors only` toggle; columns `Time (s)`, `Foot`, `Beat`, `Error (ms)`, `Status`. Clicking a row jumps the video to that step.
 - **Keyboard.** Space = play/pause; ←/→ = ±1 s (Shift: ±0.1 s).
+- **View switcher:** `Camera + Skeleton` | `Top-Down Footwork Map` | `Split View`. The map is a pure-vector top-down floor reconstruction from the stereo 3D feet (`points3d.npz`), synced with playback:
+  - **Floor frame.** Per dance block, the origin is the centre stance before the first step, +y is the dancer's facing (FRONT, from heel→toe; falls back to PCA if toes aren't tracked), and +x is the dancer's right. The grid has 10 cm minor and 50 cm major lines.
+  - **Ideal On-1 basic.** Dashed footprints and arrows scaled to `height_meters` (reach ≈ 0.16 × height, about 27 cm at 1.70 m):
+    - 1 = left forward;
+    - 2 = right in place;
+    - 3 = left back to centre;
+    - 5 = right backward;
+    - 6 = left in place;
+    - 7 = right back to centre;
+    - 4 & 8 = feet together.
+  - **Actual steps.** Solid footprints in cyan (left) / magenta (right) with a timing-coloured contour (green / amber / red), plus dotted error vectors with the distance to the ideal target.
+  - **Window modes.** `Current 8-Count Cycle` follows playback, shows faded trails of the two previous cycles, and has live foot markers. `All Steps Overlay` shows every step as a footprint heatmap plus the yellow centre-drift path.
+  - **Selection.** Clicking a table row, timeline marker or footprint highlights that footprint and shows its timing error (ms), step length (cm) and position offset (cm).
+  - **Metrics:** main-step length L / R, forward (beat 1) vs backward (beat 5) symmetry %, mean placement error, and max centre drift. Placement error is measured against each 8-count cycle's own centre stance, so slow drift is reported separately and does not inflate every step's error. Up to two spatial bullets are added to the coaching panel.
+  - **Export.** `main.py` also writes these as `footwork` (metrics, ideal pattern, per-step floor positions) and `floor_x_cm` / `floor_y_cm` / `placement_err_cm` per step in `epochs_and_steps.json`.
 - **Off-beat warning.** If every step sits about half a beat from the pulse, the dashboard warns that the song's beat grid is probably on the off-beat. Check with the metronome, then fix it with *Tap Beat 1 Now* and save.
 
 ## 7. Troubleshooting
@@ -160,7 +175,8 @@ It opens `http://127.0.0.1:8765/`. Options: `--port`, `--no-browser`, and `--rea
 | `visualize.py` | `rhythm_analysis.png` |
 | `main.py` | Config loading and merging, batch orchestration, exports, summary table, overlay step |
 | `overlay_video.py` | Skeleton (glowing legs and feet), foot-specific timing callouts and an 8-count strip rendered onto cam1; H.264 + audio via ffmpeg |
-| `dashboard.py` | Local single-screen rhythm dashboard (`http.server`): drift-corrected video + music player, offset calibration and saving, scorecard, coaching, error timeline and step log |
+| `footwork.py` | Top-down floor reconstruction: facing-aligned floor frame, ideal On-1 basic scaled to height, placement error, step length, forward/back symmetry, drift |
+| `dashboard.py` | Local single-screen rhythm dashboard (`http.server`): drift-corrected video + music player, offset calibration and saving, scorecard, coaching, top-down footwork map, error timeline and step log |
 
 Each stage also has its own CLI for debugging (`pose_2d.py`, `sync.py`, `music_analyzer.py`).
 
@@ -168,7 +184,7 @@ Each stage also has its own CLI for debugging (`pose_2d.py`, `sync.py`, `music_a
 ```bash
 pytest -q
 ```
-91 synthetic tests (`tests/test_pipeline.py`, `tests/test_overlay_dashboard.py`); no video, audio or model files are needed. They include an end-to-end run of `main.py` on two simulated subjects:
+106 synthetic tests (`tests/test_pipeline.py`, `tests/test_overlay_dashboard.py`); no video, audio or model files are needed. They include an end-to-end run of `main.py` on two simulated subjects:
 - a timeline of 10 s idle with a clap, 16 s of 180 BPM basic steps, 8 s idle, and 16 s more stepping;
 - each subject projected into two virtual cameras;
 - checks: sync, epoch boundaries, zero idle/clap false steps, 100% QUICK/SLOW and beat-count accuracy, beat offsets including a deliberate 60 ms late drift, and all exported files.

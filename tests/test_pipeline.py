@@ -779,6 +779,21 @@ def test_e2e_beat_offsets_and_drift(e2e_run, sid):
     assert 15 < np.median(lengths) < 35
 
 
+@pytest.mark.parametrize("sid", list(SUBJECTS))
+def test_e2e_footwork_exported(e2e_run, sid):
+    rep = e2e_run["reports"][sid]
+    fw = rep["footwork"]
+    assert fw["available"] and fw["method"] == ["foot_facing"]
+    m = fw["metrics"]
+    s = SUBJECTS[sid][0] / 1.70
+    # synthetic dancer: L forward 25 cm (x s) on 1 from a +5 cm replace position; R back symmetric
+    assert m["fwd_reach_cm"] == pytest.approx(20 * s, abs=4) and m["back_reach_cm"] == pytest.approx(20 * s, abs=4)
+    assert m["fwd_back_symmetry_pct"] > 85 and m["placement_err_cm"] < 8
+    assert all(d["dist_cm"] < 10 for d in m["drift"])
+    l1 = next(st for st in rep["steps"] if st["beat_count"] == 1)
+    assert l1["floor_x_cm"] < 0 and l1["floor_y_cm"] > 15  # left foot, on the left, forward
+
+
 # --------------------------------------------------------------------------- #
 # Step 3 unit tests
 # --------------------------------------------------------------------------- #

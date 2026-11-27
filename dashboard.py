@@ -246,10 +246,12 @@ def shift_report(report: dict[str, Any], new_offset: float) -> dict[str, Any]:
 
 
 def build_dashboard_data(report: dict[str, Any], media: dict[str, Any] | None = None,
-                         mp3_offset: float | None = None) -> dict[str, Any]:
+                         mp3_offset: float | None = None, floor: dict[str, Any] | None = None) -> dict[str, Any]:
     """Everything the web page needs, derived from epochs_and_steps.json.
 
     If ``mp3_offset`` is given, the steps are re-scored with the music at that offset.
+    ``floor`` is the top-down footwork data from ``footwork.compute_footwork``. It does
+    not depend on the music offset.
     """
     analyzed_offset = float((report.get("music") or {}).get("mp3_offset_sec") or 0.0)
     if mp3_offset is not None and abs(float(mp3_offset) - analyzed_offset) > 1e-9:
@@ -291,6 +293,17 @@ def build_dashboard_data(report: dict[str, Any], media: dict[str, Any] | None = 
             "is_error": (not tap) and off is not None and abs(off) > ON_TIME_MS,
             "epoch_id": s.get("epoch_id"), "step_length_cm": s.get("step_length_cm"),
         })
+    coaching = coaching_notes(steps_all, period, n_taps)
+    if floor and floor.get("available"):
+        import footwork
+
+        # spatial bullets right after the first (headline) timing note, so they are visible without scrolling
+        coaching = coaching[:1] + footwork.spatial_notes(floor.get("metrics", {})) + coaching[1:]
+        by_i = {f["i"]: f for f in floor.get("steps", [])}
+        for so in steps_out:
+            f = by_i.get(so["i"])
+            if f:
+                so["floor"] = {"x": f["x"], "y": f["y"], "err_cm": f["err_cm"], "len_cm": f["len_cm"], "cycle": f["cycle"]}
     epochs = [{"id": e["epoch_id"], "start": e["start_sec"], "end": e["end_sec"]} for e in report.get("epochs", [])]
     t_end = max([e["end"] for e in epochs] + [s["t"] for s in steps_out] + [0.0])
     n_err = sum(s["is_error"] for s in steps_out)
@@ -317,8 +330,10 @@ def build_dashboard_data(report: dict[str, Any], media: dict[str, Any] | None = 
             "n_taps": n_taps,
             "n_blocks": len(epochs),
         },
-        "coaching": coaching_notes(steps_all, period, n_taps),
+        "coaching": coaching,
         "steps": steps_out,
+        "floor": floor if floor and floor.get("available") else {"available": False,
+                                                                  "reason": (floor or {}).get("reason", "no 3D data")},
         "epochs": epochs,
         "beats": timeline.beats_with_counts(),
         "duration": t_end,
@@ -385,7 +400,8 @@ RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
 def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str, Path | None],
-                 save_cb: Callable[[float], dict[str, Any]] | None, state: dict[str, Any]):
+                 save_cb: Callable[[float], dict[str, Any]] | None, state: dict[str, Any],
+                 floor: dict[str, Any] | None = None):
     page = INDEX_HTML.encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
@@ -465,7 +481,7 @@ def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str,
                     except ValueError:
                         return self._json(400, {"ok": False, "error": "invalid mp3_offset"})
                 data = build_dashboard_data(report, dict(media, can_save=save_cb is not None,
-                                                         saved_offset=state.get("saved_offset")), off)
+                                                         saved_offset=state.get("saved_offset")), off, floor)
                 return self._json(200, data)
             if route in ("/media/video", "/media/audio"):
                 f = files.get(route.rsplit("/", 1)[-1])
@@ -501,17 +517,35 @@ def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str,
 
 def make_server(report: dict[str, Any], media: dict[str, Any], video: Path | None, audio: Path | None,
                 host: str = "127.0.0.1", port: int = 8765,
-                save_cb: Callable[[float], dict[str, Any]] | None = None) -> ThreadingHTTPServer:
+                save_cb: Callable[[float], dict[str, Any]] | None = None,
+                floor: dict[str, Any] | None = None) -> ThreadingHTTPServer:
     mimetypes.add_type("audio/mpeg", ".mp3")
     mimetypes.add_type("audio/wav", ".wav")
     mimetypes.add_type("video/mp4", ".mp4")
     state: dict[str, Any] = {"saved_offset": None}
-    handler = make_handler(report, media, {"video": video, "audio": audio}, save_cb, state)
+    handler = make_handler(report, media, {"video": video, "audio": audio}, save_cb, state, floor)
     return ThreadingHTTPServer((host, port), handler)
 
 
+def load_floor(out_dir: Path, report: dict[str, Any], height_m: float) -> dict[str, Any]:
+    """Top-down footwork data, recomputed from points3d.npz if present, else read from the report."""
+    import footwork
+
+    p = out_dir / "points3d.npz"
+    if p.is_file():
+        try:
+            with np.load(p) as z:
+                return footwork.compute_footwork(z["points3d"], z["cam1_frames"], float(z["fps"]), report, height_m)
+        except Exception as exc:  # corrupt / incompatible file
+            log.warning("Could not compute footwork from %s: %s", p, exc)
+    fw = report.get("footwork")
+    if fw and fw.get("available"):
+        return fw
+    return {"available": False, "reason": f"{p.name} not found: re-run main.py for this session"}
+
+
 def load_subject(config: str, subject: str | None, prepare_audio: bool = True):
-    """Return (report, media, video_path, audio_path, notes, session_id)."""
+    """Return (report, media, video_path, audio_path, notes, session_id, floor)."""
     from main import load_config
 
     cfg = load_config(config)
@@ -549,7 +583,10 @@ def load_subject(config: str, subject: str | None, prepare_audio: bool = True):
         notes.append("Song (.mp3) not found; the metronome still works.")
     media = {"video": video is not None, "video_is_overlay": is_overlay, "audio": audio is not None,
              "audio_format": audio.suffix.lstrip(".") if audio else None, "notes": notes}
-    return report, media, video, audio, notes, sess["id"]
+    floor = load_floor(out_dir, report, float(sess["height_meters"]))
+    if not floor.get("available"):
+        notes.append(f"Footwork map unavailable: {floor.get('reason')}")
+    return report, media, video, audio, notes, sess["id"], floor
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -562,11 +599,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--read-only", action="store_true", help="disable 'Save offset to sessions.json'")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    report, media, video, audio, notes, sid = load_subject(args.config, args.subject)
+    report, media, video, audio, notes, sid, floor = load_subject(args.config, args.subject)
     for n in notes:
         log.warning(n)
     save_cb = None if args.read_only else (lambda v: save_offset_to_config(args.config, sid, v))
-    server = make_server(report, media, video, audio, args.host, args.port, save_cb)
+    server = make_server(report, media, video, audio, args.host, args.port, save_cb, floor)
     url = f"http://{args.host}:{server.server_address[1]}/"
     print(f"Rhythm dashboard for {sid}: {url}  (Ctrl+C to quit)")
     if not args.no_browser:
@@ -605,7 +642,20 @@ header .meta{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidde
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px;vertical-align:0}
 main{display:grid;grid-template-columns:minmax(0,55fr) minmax(0,45fr);gap:12px;padding:10px 12px 12px;min-height:0}
 .col{display:grid;gap:8px;min-height:0;min-width:0}
-.left{grid-template-rows:minmax(0,1fr) auto auto clamp(130px,25vh,230px)}
+.left{grid-template-rows:auto minmax(0,1fr) auto auto clamp(120px,22vh,210px)}
+.viewbar{display:flex;align-items:center;gap:8px;min-width:0}
+.viewbar .seg .btn{padding:3px 10px}
+.stage{position:relative;display:grid;gap:8px;min-height:0;grid-template-columns:1fr}
+.stage.mode-split{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+.stage.mode-camera .mapwrap{display:none}
+.stage.mode-map .videowrap{position:absolute;left:0;top:0;width:2px;height:2px;opacity:0;pointer-events:none;border:0}
+.mapwrap{position:relative;min-height:0;min-width:0;background:#0d141f;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+#map{position:absolute;inset:0;width:100%;height:100%;display:block}
+#map .fp{cursor:pointer}
+.mapcard{position:absolute;background:rgba(11,18,32,.86);border:1px solid #273449;border-radius:8px;padding:6px 9px;font-size:11.5px;line-height:1.45;pointer-events:none;max-width:62%}
+.mapcard b{color:var(--text);font-weight:650} .mapcard .k{color:var(--muted)}
+#mapMetrics{left:8px;top:8px} #mapSel{left:8px;bottom:8px;display:none;pointer-events:auto;max-width:55%} #mapLegend{right:8px;bottom:8px;text-align:right;max-width:44%;font-size:10.5px}
+.mapempty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);padding:20px;text-align:center}
 .right{grid-template-rows:auto auto minmax(0,1fr)}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-height:0;min-width:0}
 .card h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 6px;font-weight:650;display:flex;align-items:center;gap:8px}
@@ -681,7 +731,24 @@ tbody tr{cursor:pointer} tbody tr:hover{background:#1b2534} tbody tr.cur{backgro
 </header>
 <main>
   <div class="col left">
-    <div class="videowrap"><video id="video" src="media/video" preload="auto" playsinline muted></video></div>
+    <div class="viewbar">
+      <div class="seg" id="views">
+        <button class="btn on" data-view="camera">Camera + Skeleton</button><button class="btn" data-view="map">Top-Down Footwork Map</button><button class="btn" data-view="split">Split View</button>
+      </div>
+      <span class="spacer"></span>
+      <div class="seg" id="mapModes">
+        <button class="btn on" data-mapmode="cycle" title="Only the active 8-count phrase, with faded trails of the previous ones">Current 8-Count Cycle</button><button class="btn" data-mapmode="all" title="Every detected footstep at once">All Steps Overlay</button>
+      </div>
+    </div>
+    <div class="stage mode-camera" id="stage">
+      <div class="videowrap"><video id="video" src="media/video" preload="auto" playsinline muted></video></div>
+      <div class="mapwrap" id="mapwrap">
+        <svg id="map"></svg>
+        <div class="mapcard" id="mapMetrics"></div>
+        <div class="mapcard" id="mapLegend"></div>
+        <div class="mapcard" id="mapSel"></div>
+      </div>
+    </div>
     <div class="card bar" style="padding:6px 10px">
       <button class="btn icon" id="play" title="Play / pause (space)">▶</button>
       <span class="mono lbl" id="time">0.00 / 0.00 s</span>
@@ -802,7 +869,7 @@ function renderTable(){
     const cells = [fmt(s.t,2), s.foot, s.beat ?? '–', s.offset_ms == null || s.timing_type === 'TAP' ? '–' : sgn(s.offset_ms,0), ''];
     cells.forEach((c, j) => { const td = document.createElement('td'); td.textContent = c; if (j===1) td.className = 'foot-'+s.foot; tr.appendChild(td); });
     const tag = document.createElement('span'); tag.className = 'tag c-'+s.category; tag.textContent = s.status; tr.children[4].appendChild(tag);
-    tr.addEventListener('click', () => seek(s.t));
+    tr.addEventListener('click', () => { seek(s.t); selectStep(s.i); });
     tb.appendChild(tr); rows.push([s, tr]);
   }
   $('fAll').classList.toggle('on', !filterErrors); $('fErr').classList.toggle('on', filterErrors);
@@ -845,7 +912,7 @@ function drawTimeline(){
       tip.innerHTML = ''; const b = document.createElement('b'); b.style.color = FOOT[s.foot]; b.textContent = s.foot === 'L' ? 'Left foot' : 'Right foot'; tip.appendChild(b);
       tip.appendChild(document.createTextNode(` · ${s.t.toFixed(2)} s · Beat ${s.beat ?? '–'} · ${sgn(s.offset_ms,0)} ms · ${s.status}`)); });
     p.addEventListener('mouseleave', () => tip.style.display = 'none');
-    p.addEventListener('click', ev => { ev.stopPropagation(); seek(Math.max(0, s.t - 1.0), true); });
+    p.addEventListener('click', ev => { ev.stopPropagation(); seek(Math.max(0, s.t - 1.0), true); selectStep(s.i); });
   }
   playhead = el('line', {x1:X(0), x2:X(0), y1:PT, y2:H-PB, stroke:'#ffc400', 'stroke-width':1.5});
 }
@@ -854,7 +921,7 @@ svg.addEventListener('click', ev => { if (!TL) return; const r = svg.getBounding
 new ResizeObserver(() => drawTimeline()).observe(svg);
 video.addEventListener('loadedmetadata', drawTimeline);
 
-function renderAll(){ renderHeader(); renderScore(); renderTable(); drawTimeline(); $('offset').value = offset.toFixed(3); }
+function renderAll(){ renderHeader(); renderScore(); renderTable(); drawTimeline(); $('offset').value = offset.toFixed(3); MAP.redraw(); }
 
 // ======================= audio sync engine =======================
 // target_audio_time = video.currentTime - mp3_offset_sec. Enforced on play/pause/seeked/ratechange
@@ -984,6 +1051,211 @@ function metronomeTick(){
   }
 }
 
+
+// ======================= top-down footwork map =======================
+// Floor frame (cm): +y = dancer's facing ("FRONT"), +x = dancer's right, origin = centre stance of the block.
+const SOLE = [[0,-.5],[.12,-.47],[.16,-.36],[.14,-.12],[.19,.12],[.2,.3],[.15,.44],[.06,.5],[-.05,.49],[-.14,.42],[-.18,.26],[-.17,.06],[-.13,-.14],[-.15,-.35],[-.11,-.47]];
+const STATUS_COL = {on_time:'#22c55e', early:'#f59e0b', late:'#f59e0b', off_early:'#ef4444', off_late:'#ef4444', none:'#64748b'};
+const MAP = (() => {
+  const svg = $('map'); let mode = 'cycle', view = 'camera', sel = null, pin = null, shownCycle = null, live = null, geom = null;
+  const stepByI = () => { const m = new Map(); for (const s of D.steps) m.set(s.i, s); return m; };
+  const F = () => D.floor || {available:false};
+  function fstep(i){ return (F().steps || []).find(f => f.i === i); }
+  function cycleAt(t){
+    const fl = F(); if (!fl.available || !fl.cycles.length) return null;
+    if (pin != null){ const c = fl.cycles.find(c => c.id === pin); if (c && t >= c.t0 - 1.6 && t <= c.t1 + 1.2) return pin; pin = null; }
+    let cur = fl.cycles[0].id; for (const c of fl.cycles){ if (c.t0 <= t + 0.05) cur = c.id; else break; }
+    return cur;
+  }
+  function footPts(x, y, headDeg, foot, Lf){
+    const h = headDeg * Math.PI / 180, fx = Math.sin(h), fy = Math.cos(h), rx = Math.cos(h), ry = -Math.sin(h);
+    const W = Lf * 1.0, mir = foot === 'L' ? 1 : -1;   // arch on the inner side
+    return SOLE.map(([u, v]) => { const uu = u * mir * W, vv = v * Lf; return geom.px(x + vv*fx + uu*rx, y + vv*fy + uu*ry); });
+  }
+  function el(tag, attrs, parent = svg){ const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent.appendChild(e); return e; }
+  function text(x, y, str, attrs = {}, parent = svg){ const t = el('text', Object.assign({x, y, fill:'#cbd5e1', 'font-size':11, 'text-anchor':'middle'}, attrs), parent); t.textContent = str; return t; }
+  function setGeom(bounds){
+    const W = svg.clientWidth, H = svg.clientHeight; if (W < 40 || H < 40) return false;
+    const [x0, x1, y0, y1] = bounds, pad = 26, k = Math.min((W - 2*pad) / (x1 - x0), (H - 2*pad - 14) / (y1 - y0));
+    const cx = W / 2, cy = H / 2 + 7, xm = (x0 + x1) / 2, ym = (y0 + y1) / 2;
+    geom = {W, H, k, px: (x, y) => [cx + (x - xm) * k, cy - (y - ym) * k], bounds};
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`); return true;
+  }
+  function arrow(from, to, col, bend, label){
+    const [ax, ay] = geom.px(...from), [bx, by] = geom.px(...to), mx = (ax + bx) / 2, my = (ay + by) / 2;
+    const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy) || 1, nx = -dy / len, ny = dx / len;
+    const qx = mx + nx * bend, qy = my + ny * bend;
+    el('path', {d:`M${ax} ${ay} Q${qx} ${qy} ${bx} ${by}`, fill:'none', stroke:col, 'stroke-width':1.4, 'stroke-dasharray':'5 4', 'stroke-opacity':.75, 'marker-end':`url(#arr-${col.slice(1)})`});
+    if (label) text(qx + nx * 9, qy + ny * 9 + 4, label, {fill:col, 'font-size':11, 'font-weight':700});
+  }
+  function drawIdeal(anchor){
+    const fl = F(), id = fl.ideal, Lf = id.foot_length_cm, [ax, ay] = anchor, hs = id.half_stance_cm, R = id.reach_cm;
+    const spots = [['L', -hs, 0, '3 · 6'], ['R', hs, 0, '2 · 7'], ['L', -hs, R, '1'], ['R', hs, -R, '5']];
+    for (const [foot, x, y, lab] of spots){
+      const col = foot === 'L' ? '#00e5ff' : '#ff4081', pts = footPts(ax + x, ay + y, 0, foot, Lf);
+      el('polygon', {points: pts.map(p => p.join(',')).join(' '), fill:'none', stroke:col, 'stroke-opacity':.55, 'stroke-width':1.6, 'stroke-dasharray':'4 3', 'stroke-linejoin':'round'});
+      const [lx, ly] = geom.px(ax + x + (foot === 'L' ? -1 : 1) * (id.foot_width_cm * .5 + 7), ay + y);
+      text(lx, ly + 4, lab, {fill:col, 'fill-opacity':.8, 'font-size':12, 'font-weight':700});
+    }
+    arrow([ax - hs - 3, ay + Lf * .55], [ax - hs - 3, ay + R - Lf * .55], '#00e5ff', -14, '1');
+    arrow([ax - hs + 3, ay + R - Lf * .55], [ax - hs + 3, ay + Lf * .55], '#00e5ff', -14, '3');
+    arrow([ax + hs - 3, ay - Lf * .55], [ax + hs - 3, ay - R + Lf * .55], '#ff4081', -14, '5');
+    arrow([ax + hs + 3, ay - R + Lf * .55], [ax + hs + 3, ay - Lf * .55], '#ff4081', -14, '7');
+    const [sx, sy] = geom.px(ax, ay - Lf * .62);
+    text(sx, sy + 12, '4 & 8: feet together', {fill:'#94a3b8', 'font-size':10});
+  }
+  function drawGrid(){
+    const [x0, x1, y0, y1] = geom.bounds;
+    for (let v = Math.ceil(x0 / 10) * 10; v <= x1; v += 10){ const [a] = geom.px(v, 0); el('line', {x1:a, x2:a, y1:geom.px(0, y1)[1], y2:geom.px(0, y0)[1], stroke: v % 50 === 0 ? '#2a3a52' : '#172131', 'stroke-width': v % 50 === 0 ? 1.2 : 1}); }
+    for (let v = Math.ceil(y0 / 10) * 10; v <= y1; v += 10){ const [, b] = geom.px(0, v); el('line', {y1:b, y2:b, x1:geom.px(x0, 0)[0], x2:geom.px(x1, 0)[0], stroke: v % 50 === 0 ? '#2a3a52' : '#172131', 'stroke-width': v % 50 === 0 ? 1.2 : 1}); }
+    for (let v = Math.ceil(x0 / 50) * 50; v <= x1; v += 50) if (v){ const [a, b] = geom.px(v, y0); text(a, b - 4, `${v} cm`, {fill:'#5b6b82', 'font-size':9.5}); }
+    for (let v = Math.ceil(y0 / 50) * 50; v <= y1; v += 50) if (v){ const [a, b] = geom.px(x0, v); text(a + 4, b - 3, `${v} cm`, {fill:'#5b6b82', 'font-size':9.5, 'text-anchor':'start'}); }
+    const [ox, oy] = geom.px(0, 0);
+    el('line', {x1:ox - 9, x2:ox + 9, y1:oy, y2:oy, stroke:'#94a3b8', 'stroke-width':1.5});
+    el('line', {x1:ox, x2:ox, y1:oy - 9, y2:oy + 9, stroke:'#94a3b8', 'stroke-width':1.5});
+    text(ox + 12, oy + 14, '0,0', {fill:'#64748b', 'font-size':9.5, 'text-anchor':'start'});
+    const [fx, fy] = geom.px((x0 + x1) / 2, y1);
+    el('path', {d:`M${fx} ${fy - 6} l-7 11 h14 z`, fill:'#e2e8f0'});
+    text(fx, fy + 18, 'FRONT / FACING', {fill:'#e2e8f0', 'font-size':10.5, 'font-weight':700, 'letter-spacing':'.06em'});
+  }
+  function drawActual(fs, s, alpha, opts = {}){
+    const fl = F(), Lf = fl.ideal.foot_length_cm, col = s.foot === 'L' ? '#00e5ff' : '#ff4081';
+    const g = el('g', {class:'fp', opacity: alpha});
+    const pts = footPts(fs.x, fs.y, fs.heading_deg || 0, s.foot, Lf).map(p => p.join(',')).join(' ');
+    const [cx, cy] = geom.px(fs.x, fs.y), st = STATUS_COL[s.category] || '#64748b';
+    if (!opts.faint){
+      // status ring = thick timing-coloured contour around the footprint, then the foot-coloured sole
+      el('polygon', {points: pts, fill:'none', stroke:st, 'stroke-width':6, 'stroke-linejoin':'round', 'stroke-opacity':.95}, g);
+      el('polygon', {points: pts, fill:col, 'fill-opacity':.85, stroke:'#0b1220', 'stroke-width':1.2, 'stroke-linejoin':'round'}, g);
+    } else {
+      el('polygon', {points: pts, fill:col, 'fill-opacity':.14, stroke:col, 'stroke-opacity':.35, 'stroke-width':1, 'stroke-linejoin':'round'}, g);
+      el('circle', {cx, cy, r: 3.2, fill: st}, g);
+    }
+    if (!opts.faint && s.beat) text(cx, cy + 4, String(s.beat), {fill:'#0b1220', 'font-size':11, 'font-weight':800}, g);
+    g.addEventListener('mousemove', ev => { tip.style.display = 'block'; tip.style.left = (ev.clientX + 12) + 'px'; tip.style.top = (ev.clientY - 34) + 'px';
+      tip.textContent = `${s.foot === 'L' ? 'Left' : 'Right'} foot · Beat ${s.beat ?? '–'} · ${s.t.toFixed(2)} s · ${sgn(s.offset_ms,0)} ms ${s.status}` + (fs.err_cm != null ? ` · offset ${fs.err_cm.toFixed(0)} cm` : ''); });
+    g.addEventListener('mouseleave', () => tip.style.display = 'none');
+    g.addEventListener('click', ev => { ev.stopPropagation(); seek(s.t); selectStep(s.i); });
+    return g;
+  }
+  function errVector(fs, strong){
+    if (fs.target_x == null || fs.err_cm == null) return;
+    const [ax, ay] = geom.px(fs.x, fs.y), [bx, by] = geom.px(fs.target_x, fs.target_y);
+    el('line', {x1:ax, y1:ay, x2:bx, y2:by, stroke: strong ? '#f8fafc' : '#94a3b8', 'stroke-width': strong ? 1.6 : 1.1, 'stroke-dasharray':'2 3', 'stroke-opacity': strong ? .95 : .7});
+    el('circle', {cx:bx, cy:by, r:2.4, fill: strong ? '#f8fafc' : '#94a3b8'});
+    if (fs.err_cm >= 3 || strong) text((ax + bx) / 2 + 12, (ay + by) / 2, `${fs.err_cm.toFixed(0)} cm`, {fill: strong ? '#f8fafc' : '#94a3b8', 'font-size':10, 'font-weight':600});
+  }
+  function defs(){
+    const d = el('defs', {});
+    for (const c of ['#00e5ff', '#ff4081']){ const m = el('marker', {id:'arr-' + c.slice(1), viewBox:'0 0 10 10', refX:8, refY:5, markerWidth:7, markerHeight:7, orient:'auto-start-reverse'}, d);
+      el('path', {d:'M0 0 L10 5 L0 10 z', fill:c, 'fill-opacity':.8}, m); }
+    const f = el('filter', {id:'glow', x:'-50%', y:'-50%', width:'200%', height:'200%'}, d);
+    el('feGaussianBlur', {stdDeviation:3, result:'b'}, f); const mg = el('feMerge', {}, f); el('feMergeNode', {in:'b'}, mg); el('feMergeNode', {in:'SourceGraphic'}, mg);
+  }
+  function redraw(){
+    if (view === 'camera') return;
+    const fl = F(); svg.innerHTML = ''; $('mapSel').style.display = 'none';
+    const empty = $('mapwrap').querySelector('.mapempty'); if (empty) empty.remove();
+    if (!fl.available){ const d = document.createElement('div'); d.className = 'mapempty'; d.textContent = 'Footwork map unavailable: ' + (fl.reason || 'no 3D data') + '.'; $('mapwrap').appendChild(d);
+      $('mapMetrics').style.display = $('mapLegend').style.display = 'none'; return; }
+    $('mapMetrics').style.display = $('mapLegend').style.display = '';
+    const S = stepByI(), all = fl.steps.filter(f => S.has(f.i) && S.get(f.i).timing_type !== 'TAP');
+    const t = video.currentTime || 0; shownCycle = cycleAt(t);
+    const cyc = fl.cycles.find(c => c.id === shownCycle), anchor = (mode === 'cycle' && cyc) ? cyc.anchor : [0, 0];
+    let b;
+    if (mode === 'cycle'){ const r = Math.max(60, fl.ideal.reach_cm + 30); b = [anchor[0] - r, anchor[0] + r, anchor[1] - r, anchor[1] + r]; }
+    else { const xs = all.map(f => f.x).concat([-60, 60]), ys = all.map(f => f.y).concat([-60, 60]);
+      b = [Math.min(...xs) - 18, Math.max(...xs) + 18, Math.min(...ys) - 22, Math.max(...ys) + 22]; }
+    if (!setGeom(b)) return;
+    defs(); drawGrid(); drawIdeal(anchor);
+    if (mode === 'cycle'){
+      const ids = fl.cycles.filter(c => c.epoch === (cyc ? cyc.epoch : null)).map(c => c.id), pos = ids.indexOf(shownCycle);
+      for (const [back, a] of [[2, .16], [1, .3]]){ const cid = ids[pos - back]; if (cid == null) continue;
+        for (const f of all.filter(f => f.cycle === cid)) drawActual(f, S.get(f.i), a, {faint:true}); }
+      const cur = all.filter(f => f.cycle === shownCycle);
+      for (const f of cur) errVector(f, false);
+      for (const f of cur) drawActual(f, S.get(f.i), 1);
+    } else {
+      // all steps: faint footprints (overlaps build up a heatmap) + anchor drift path per block
+      for (const f of all) drawActual(f, S.get(f.i), .9, {faint:true});
+      for (const e of D.epochs){ const cs = fl.cycles.filter(c => c.epoch === e.id); if (cs.length < 2) continue;
+        el('polyline', {points: cs.map(c => geom.px(...c.anchor).join(',')).join(' '), fill:'none', stroke:'#facc15', 'stroke-width':1.6, 'stroke-dasharray':'1 4', 'stroke-linecap':'round'});
+        const [lx, ly] = geom.px(...cs[cs.length - 1].anchor); el('circle', {cx:lx, cy:ly, r:3.5, fill:'#facc15'}); }
+    }
+    if (sel != null){ const f = fstep(sel), s = S.get(sel);
+      if (f && s && (mode === 'all' || f.cycle === shownCycle)){
+        if (mode === 'all') drawActual(f, s, 1);
+        errVector(f, true);
+        const [cx, cy] = geom.px(f.x, f.y);
+        const ring = el('polygon', {points: footPts(f.x, f.y, f.heading_deg || 0, s.foot, fl.ideal.foot_length_cm * 1.22).map(p => p.join(',')).join(' '), fill:'none', stroke:'#fff', 'stroke-width':2.2, filter:'url(#glow)'});
+        el('animate', {attributeName:'stroke-opacity', values:'1;.25;1', dur:'1.2s', repeatCount:'indefinite'}, ring);
+        showSel(f, s);
+      }
+    }
+    live = {L: el('circle', {r:6, fill:'#00e5ff', stroke:'#0b1220', 'stroke-width':1.5, filter:'url(#glow)', opacity:0}),
+            R: el('circle', {r:6, fill:'#ff4081', stroke:'#0b1220', 'stroke-width':1.5, filter:'url(#glow)', opacity:0})};
+    metrics(); tick(t, true);
+  }
+  function showSel(f, s){
+    const c = $('mapSel'); c.style.display = 'block'; c.innerHTML = '';
+    const add = (k, v) => { const d = document.createElement('div'); const a = document.createElement('span'); a.className = 'k'; a.textContent = k + ' ';
+      const b = document.createElement('b'); b.textContent = v; d.appendChild(a); d.appendChild(b); c.appendChild(d); };
+    const h = document.createElement('div'); h.style.fontWeight = 700; h.style.color = s.foot === 'L' ? '#00e5ff' : '#ff4081';
+    h.textContent = `${s.label} · ${s.foot === 'L' ? 'Left' : 'Right'} foot · Beat ${s.beat ?? '–'} · ${s.t.toFixed(2)} s`; c.appendChild(h);
+    add('Timing error', s.offset_ms == null ? '–' : `${sgn(s.offset_ms,0)} ms (${s.status})`);
+    add('Step length', f.len_cm == null ? '–' : `${f.len_cm.toFixed(0)} cm`);
+    add('Position offset', f.err_cm == null ? '– (no ideal target)' : `${f.err_cm.toFixed(0)} cm from ideal footprint`);
+  }
+  function metrics(){
+    const m = F().metrics || {}, c = $('mapMetrics'); c.innerHTML = '';
+    const row = (k, v) => { const d = document.createElement('div'); const a = document.createElement('span'); a.className = 'k'; a.textContent = k + ' ';
+      const b = document.createElement('b'); b.textContent = v; d.appendChild(a); d.appendChild(b); c.appendChild(d); };
+    const cm = v => v == null ? '–' : v.toFixed(0) + ' cm';
+    row('Step length L / R', `${cm(m.big_step_len_L_cm)} / ${cm(m.big_step_len_R_cm)}`);
+    row('Fwd / back symmetry', m.fwd_back_symmetry_pct == null ? '–' : `${m.fwd_back_symmetry_pct.toFixed(0)}% (${cm(m.fwd_reach_cm)} / ${cm(m.back_reach_cm)})`);
+    row('Placement error', cm(m.placement_err_cm));
+    const dr = (m.drift || []).reduce((a, d) => d.dist_cm > (a ? a.dist_cm : -1) ? d : a, null);
+    row('Max drift', dr ? `${cm(dr.dist_cm)} over ${dr.bars} bars` : '–');
+    const L = $('mapLegend'); L.innerHTML = '';
+    const lg = (html) => { const d = document.createElement('div'); d.innerHTML = html; L.appendChild(d); };
+    lg('<span style="color:#94a3b8">┄ ideal On-1 basic</span> · <span style="color:#e2e8f0">solid = actual</span>');
+    lg('<span style="color:#00e5ff">■ left</span> <span style="color:#ff4081">■ right</span> · ring: <span style="color:#22c55e">on time</span> <span style="color:#f59e0b">early/late</span> <span style="color:#ef4444">off-beat</span>');
+    lg(mode === 'cycle' ? `<span class="k">cycle ${shownCycle == null ? '–' : shownCycle + 1} of ${F().cycles.length}</span>` : '<span class="k">all steps · <span style="color:#facc15">┈ centre drift</span></span>');
+  }
+  function lerpTrack(t){
+    const tr = F().track; if (!tr || !tr.t.length) return null;
+    let lo = 0, hi = tr.t.length - 1; if (t < tr.t[0] || t > tr.t[hi]) return null;
+    while (hi - lo > 1){ const m = (lo + hi) >> 1; if (tr.t[m] <= t) lo = m; else hi = m; }
+    const a = (t - tr.t[lo]) / Math.max(1e-6, tr.t[hi] - tr.t[lo]), out = {};
+    for (const f of ['L', 'R']){ const p = tr[f][lo], q = tr[f][hi]; out[f] = (p && q) ? [p[0] + (q[0] - p[0]) * a, p[1] + (q[1] - p[1]) * a] : (p || q); }
+    return out;
+  }
+  function tick(t, force){
+    if (view === 'camera' || !F().available) return;
+    if (!force && mode === 'cycle' && cycleAt(t) !== shownCycle){ redraw(); return; }
+    if (!live || !geom) return;
+    const p = lerpTrack(t);
+    for (const f of ['L', 'R']){ const q = p && p[f];
+      if (!q){ live[f].setAttribute('opacity', 0); continue; }
+      const [x, y] = geom.px(q[0], q[1]); live[f].setAttribute('cx', x); live[f].setAttribute('cy', y); live[f].setAttribute('opacity', .95); }
+  }
+  function setView(v){ view = v; $('stage').className = 'stage mode-' + v;
+    document.querySelectorAll('[data-view]').forEach(b => b.classList.toggle('on', b.dataset.view === v));
+    $('mapModes').style.visibility = v === 'camera' ? 'hidden' : 'visible'; requestAnimationFrame(redraw); }
+  function setMode(m){ mode = m; document.querySelectorAll('[data-mapmode]').forEach(b => b.classList.toggle('on', b.dataset.mapmode === m)); redraw(); }
+  function select(i){ sel = i; const f = fstep(i); if (f) pin = f.cycle; redraw(); }
+  document.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
+  document.querySelectorAll('[data-mapmode]').forEach(b => b.addEventListener('click', () => setMode(b.dataset.mapmode)));
+  svg.addEventListener('click', () => { sel = null; pin = null; redraw(); });
+  new ResizeObserver(() => redraw()).observe($('mapwrap'));
+  $('mapModes').style.visibility = 'hidden';
+  return {redraw, tick, select, setView, setMode, get state(){ return {view, mode, sel, shownCycle}; }};
+})();
+function selectStep(i){
+  MAP.select(i);
+  for (const [s, tr] of rows) tr.style.outline = s.i === i ? '1px solid #ffc400' : '';
+}
+
 // ======================= main loop =======================
 let lastCur = null, lastDriftUi = 0;
 function frame(now){
@@ -999,12 +1271,13 @@ function frame(now){
     else if (SYNC.drift == null) d.textContent = (targetTime() < 0 && !video.paused) ? 'music starts in ' + (-targetTime()).toFixed(1) + ' s' : 'sync idle';
     else { d.textContent = 'drift ' + sgn(SYNC.drift * 1000, 0) + ' ms'; d.classList.toggle('bad', Math.abs(SYNC.drift) > SYNC.tol); }
   }
+  MAP.tick(t);
   let cur = null; for (const [s, tr] of rows){ if (s.t <= t + 1e-3) cur = tr; else break; }
   if (cur !== lastCur){ if (lastCur) lastCur.classList.remove('cur'); if (cur){ cur.classList.add('cur'); if (!video.paused) cur.scrollIntoView({block:'nearest'}); } lastCur = cur; }
   requestAnimationFrame(frame);
 }
 if (!D.media.video){ $('play').disabled = true; toast('Video not available.'); }
-window.__dash = {get offset(){ return offset; }, sync: SYNC, video, audio, setOffset, videoClock, get data(){ return D; }};
+window.__dash = {get offset(){ return offset; }, sync: SYNC, video, audio, setOffset, videoClock, map: MAP, selectStep, get data(){ return D; }};
 renderAll(); updatePlayBtn(); requestAnimationFrame(frame);
 })();
 </script>
