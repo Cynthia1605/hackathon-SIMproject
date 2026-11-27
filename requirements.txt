@@ -1,0 +1,10 @@
+# Dual-Camera 3D MediaPipe Salsa Rhythm Pipeline (Python 3.10+)
+numpy>=1.24
+scipy>=1.10
+opencv-contrib-python>=4.8   # same build mediapipe depends on; avoid installing opencv-python too
+mediapipe>=0.10.14
+librosa>=0.10.1
+soundfile>=0.12
+imageio-ffmpeg>=0.4.9   # bundled ffmpeg binary for decoding .mp4 audio
+matplotlib>=3.7
+pytest>=7.4
