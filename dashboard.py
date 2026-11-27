@@ -234,7 +234,9 @@ def shift_report(report: dict[str, Any], new_offset: float) -> dict[str, Any]:
     music["mp3_offset_sec"] = float(new_offset)
     period = float((rep.get("summary") or {}).get("beat_period_sec") or music.get("beat_period_sec") or 0.5)
     for s in rep.get("steps", []):
-        if len(grid) == 0 or s.get("beat_offset_ms") is None:
+        # re-score every step against the shifted grid, including steps that had no beat reference
+        # under the previous offset (e.g. a stale, far-off auto-aligned value)
+        if len(grid) == 0:
             continue
         t = s["timestamp_sec"]
         if t < grid[0] - period / 2 or t > grid[-1] + period / 2:
@@ -246,15 +248,21 @@ def shift_report(report: dict[str, Any], new_offset: float) -> dict[str, Any]:
 
 
 def build_dashboard_data(report: dict[str, Any], media: dict[str, Any] | None = None,
-                         mp3_offset: float | None = None, floor: dict[str, Any] | None = None) -> dict[str, Any]:
+                         mp3_offset: float | None = None, floor: dict[str, Any] | None = None,
+                         default_offset: float = 0.0) -> dict[str, Any]:
     """Everything the web page needs, derived from epochs_and_steps.json.
 
     If ``mp3_offset`` is given, the steps are re-scored with the music at that offset.
     ``floor`` is the top-down footwork data from ``footwork.compute_footwork``. It does
     not depend on the music offset.
     """
+    # The music offset is never guessed: the song plays from 0.0 s with the video unless
+    # sessions.json sets overrides.mp3_offset_sec (default_offset), or the page asks for
+    # another value (mp3_offset). Steps are re-scored against the grid at that offset.
+    if mp3_offset is None:
+        mp3_offset = float(default_offset)
     analyzed_offset = float((report.get("music") or {}).get("mp3_offset_sec") or 0.0)
-    if mp3_offset is not None and abs(float(mp3_offset) - analyzed_offset) > 1e-9:
+    if abs(float(mp3_offset) - analyzed_offset) > 1e-9:
         report = shift_report(report, float(mp3_offset))
     music = report.get("music", {}) or {}
     summary = report.get("summary", {}) or {}
@@ -313,7 +321,7 @@ def build_dashboard_data(report: dict[str, Any], media: dict[str, Any] | None = 
         "bpm": music.get("bpm"),
         "beat_period_ms": period * 1000.0,
         "mp3_offset_sec": float(music.get("mp3_offset_sec") or 0.0),
-        "mp3_offset_analyzed_sec": analyzed_offset,
+        "mp3_offset_default_sec": float(default_offset),
         "music_method": music.get("method"),
         "music_confidence": music.get("confidence"),
         "score": score,
@@ -481,7 +489,8 @@ def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str,
                     except ValueError:
                         return self._json(400, {"ok": False, "error": "invalid mp3_offset"})
                 data = build_dashboard_data(report, dict(media, can_save=save_cb is not None,
-                                                         saved_offset=state.get("saved_offset")), off, floor)
+                                                         saved_offset=state.get("saved_offset")), off, floor,
+                                            state["default_offset"])
                 return self._json(200, data)
             if route in ("/media/video", "/media/audio"):
                 f = files.get(route.rsplit("/", 1)[-1])
@@ -510,6 +519,7 @@ def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str,
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 return self._json(400, {"ok": False, "error": str(exc)})
             state["saved_offset"] = res["mp3_offset_sec"]
+            state["default_offset"] = res["mp3_offset_sec"]  # sessions.json now holds this value
             return self._json(200, res)
 
     return Handler
@@ -518,11 +528,11 @@ def make_handler(report: dict[str, Any], media: dict[str, Any], files: dict[str,
 def make_server(report: dict[str, Any], media: dict[str, Any], video: Path | None, audio: Path | None,
                 host: str = "127.0.0.1", port: int = 8765,
                 save_cb: Callable[[float], dict[str, Any]] | None = None,
-                floor: dict[str, Any] | None = None) -> ThreadingHTTPServer:
+                floor: dict[str, Any] | None = None, default_offset: float = 0.0) -> ThreadingHTTPServer:
     mimetypes.add_type("audio/mpeg", ".mp3")
     mimetypes.add_type("audio/wav", ".wav")
     mimetypes.add_type("video/mp4", ".mp4")
-    state: dict[str, Any] = {"saved_offset": None}
+    state: dict[str, Any] = {"saved_offset": None, "default_offset": float(default_offset)}
     handler = make_handler(report, media, {"video": video, "audio": audio}, save_cb, state, floor)
     return ThreadingHTTPServer((host, port), handler)
 
@@ -545,7 +555,12 @@ def load_floor(out_dir: Path, report: dict[str, Any], height_m: float) -> dict[s
 
 
 def load_subject(config: str, subject: str | None, prepare_audio: bool = True):
-    """Return (report, media, video_path, audio_path, notes, session_id, floor)."""
+    """Return (report, media, video_path, audio_path, notes, session_id, floor).
+
+    ``media["default_offset"]`` is the music offset the page starts with:
+    ``overrides.mp3_offset_sec`` from sessions.json if set, otherwise 0.0. It never
+    comes from the report, which may hold an old auto-aligned value.
+    """
     from main import load_config
 
     cfg = load_config(config)
@@ -583,6 +598,9 @@ def load_subject(config: str, subject: str | None, prepare_audio: bool = True):
         notes.append("Song (.mp3) not found; the metronome still works.")
     media = {"video": video is not None, "video_is_overlay": is_overlay, "audio": audio is not None,
              "audio_format": audio.suffix.lstrip(".") if audio else None, "notes": notes}
+    ov = (sess.get("overrides") or {}).get("mp3_offset_sec")
+    media["default_offset"] = float(ov) if ov is not None else 0.0
+    media["offset_source"] = "sessions.json" if ov is not None else "default"
     floor = load_floor(out_dir, report, float(sess["height_meters"]))
     if not floor.get("available"):
         notes.append(f"Footwork map unavailable: {floor.get('reason')}")
@@ -603,7 +621,8 @@ def main(argv: list[str] | None = None) -> int:
     for n in notes:
         log.warning(n)
     save_cb = None if args.read_only else (lambda v: save_offset_to_config(args.config, sid, v))
-    server = make_server(report, media, video, audio, args.host, args.port, save_cb, floor)
+    server = make_server(report, media, video, audio, args.host, args.port, save_cb, floor,
+                         media.get("default_offset", 0.0))
     url = f"http://{args.host}:{server.server_address[1]}/"
     print(f"Rhythm dashboard for {sid}: {url}  (Ctrl+C to quit)")
     if not args.no_browser:
@@ -767,7 +786,7 @@ tbody tr{cursor:pointer} tbody tr:hover{background:#1b2534} tbody tr.cur{backgro
       <button class="btn" data-nudge="-50">−50ms</button><button class="btn" data-nudge="-10">−10</button>
       <button class="btn" data-nudge="10">+10</button><button class="btn" data-nudge="50">+50ms</button>
       <button class="btn primary" id="tap" title="Press exactly when you hear/see beat 1 in the video">Tap Beat 1 Now</button>
-      <button class="btn" id="reset" title="Back to the analysed offset">Reset</button>
+      <button class="btn" id="reset" title="Back to the default offset (sessions.json override, else 0.000 s)">Reset</button>
       <span class="spacer"></span>
       <button class="btn" id="save">Save Offset to sessions.json</button>
       <span class="drift mono" id="drift">sync –</span>
@@ -823,7 +842,7 @@ let D = await (await fetch('api/data')).json();
 const video = $('video');
 const audio = D.media.audio ? new Audio('media/audio') : null;
 if (audio){ audio.preload = 'auto'; audio.preservesPitch = true; }
-const ANALYZED = D.mp3_offset_analyzed_sec;
+let DEFAULT_OFFSET = D.mp3_offset_default_sec;   // sessions.json override, else 0.0
 let offset = D.mp3_offset_sec;           // current mp3_offset_sec (cam1 time of song t=0)
 let filterErrors = false;
 const fmt = (v, d=0) => (v == null || Number.isNaN(v)) ? '–' : Number(v).toFixed(d);
@@ -835,9 +854,7 @@ function toast(msg, ms=4500){ const t = $('toast'); t.textContent = msg; t.style
 // ======================= rendering of analysis data =======================
 function renderHeader(){
   $('subj').textContent = D.subject_id;
-  $('meta').textContent = `${fmt(D.bpm,1)} BPM · beat ${fmt(D.beat_period_ms,0)} ms · music alignment: ${D.music_method || '–'}` +
-    (D.music_confidence != null ? ` (conf ${fmt(D.music_confidence,2)})` : '') +
-    ` · analysed offset ${fmt(ANALYZED,3)} s` + (D.media.audio_format ? ` · audio: ${D.media.audio_format}` : '');
+  $('meta').textContent = `${fmt(D.bpm,1)} BPM · beat ${fmt(D.beat_period_ms,0)} ms` + (D.media.audio_format ? ` · audio: ${D.media.audio_format}` : '');
 }
 function renderScore(){
   const v = D.verdict, sc = D.score;
@@ -928,7 +945,7 @@ function renderAll(){ renderHeader(); renderScore(); renderTable(); drawTimeline
 // and continuously in a requestAnimationFrame loop:
 //   |drift| > 40 ms  -> corrected; small drift by a gentle playbackRate trim (no audible seek),
 //   |drift| > 150 ms -> hard seek (rate-limited so we never seek every frame).
-const SYNC = {tol: 0.04, settleTol: 0.01, settleMs: 1500, hard: 0.15, lastSeek: 0, settleUntil: 0, stalled: false, drift: null};
+const SYNC = {blocked: false, tol: 0.04, settleTol: 0.01, settleMs: 1500, hard: 0.15, lastSeek: 0, settleUntil: 0, stalled: false, drift: null};
 // Smooth video clock: video.currentTime only advances once per decoded frame (33 ms steps at 30 fps),
 // which would look like +/-33 ms of "drift". requestVideoFrameCallback gives the presented frame's
 // mediaTime + its display time, so we extrapolate between frames.
@@ -955,7 +972,21 @@ function hardSync(){
     return;
   }
   audio.currentTime = t; SYNC.lastSeek = performance.now(); SYNC.settleUntil = SYNC.lastSeek + SYNC.settleMs;
-  if (audio.paused) audio.play().catch(() => {});
+  if (audio.paused) startAudio();
+}
+function startAudio(){
+  const pr = audio.play();
+  if (pr && pr.then) pr.then(() => { SYNC.blocked = false; }).catch(err => { if (err && err.name === 'NotAllowedError') SYNC.blocked = true; });
+}
+// Browsers only allow audio to start inside a user gesture: start it right in the click handler
+// (the video 'play' event may arrive after the gesture has expired).
+function primeAudio(){
+  if (!audio || !musicOn()) return;
+  SYNC.blocked = false;
+  const t = video.currentTime - offset;
+  if (inRange(t)){ audio.currentTime = t; SYNC.lastSeek = performance.now(); SYNC.settleUntil = SYNC.lastSeek + SYNC.settleMs; }
+  audio.playbackRate = video.playbackRate;
+  startAudio();
 }
 function syncTick(){
   if (!audio) return;
@@ -985,8 +1016,9 @@ $('camAudio').addEventListener('change', e => { video.muted = !e.target.checked;
 
 // ---------- transport ----------
 function updatePlayBtn(){ $('play').textContent = video.paused ? '▶' : '❚❚'; }
-$('play').onclick = () => { if (video.paused) video.play(); else video.pause(); };
-function seek(t, autoplay=false){ video.currentTime = Math.max(0, Math.min(t, (video.duration || t))); if (autoplay && video.paused) video.play(); }
+$('play').onclick = () => { if (video.paused){ primeAudio(); video.play(); } else video.pause(); };
+video.addEventListener('click', () => $('play').click());
+function seek(t, autoplay=false){ video.currentTime = Math.max(0, Math.min(t, (video.duration || t))); if (autoplay && video.paused){ primeAudio(); video.play(); } }
 let scrubbing = false;
 $('scrub').addEventListener('input', e => { scrubbing = true; if (video.duration) seek(e.target.value / 1000 * video.duration); });
 $('scrub').addEventListener('change', () => { scrubbing = false; });
@@ -1010,7 +1042,7 @@ function setOffset(v, {refetch=true} = {}){
 }
 $('offset').addEventListener('change', e => setOffset(parseFloat(e.target.value)));
 document.querySelectorAll('[data-nudge]').forEach(b => b.addEventListener('click', () => setOffset(offset + (+b.dataset.nudge) / 1000)));
-$('reset').onclick = () => setOffset(ANALYZED);
+$('reset').onclick = () => setOffset(DEFAULT_OFFSET);
 $('tap').onclick = () => {
   // The current video moment should be a beat 1 of the song: snap the nearest song "1" (in mp3 time) onto it.
   const tv = video.currentTime, m = tv - offset;
@@ -1019,12 +1051,13 @@ $('tap').onclick = () => {
   if (!ones.length){ toast('No beat grid available for this song.'); return; }
   let best = ones[0]; for (const b of ones) if (Math.abs(b - m) < Math.abs(best - m)) best = b;
   setOffset(tv - best);
-  toast(`Beat 1 placed at ${tv.toFixed(3)} s → mp3_offset_sec = ${(tv - best).toFixed(3)} s (${sgn((tv - best - ANALYZED)*1000,0)} ms vs analysis)`);
+  toast(`Beat 1 placed at ${tv.toFixed(3)} s → mp3_offset_sec = ${(tv - best).toFixed(3)} s (${sgn((tv - best - DEFAULT_OFFSET)*1000,0)} ms vs default)`);
 };
 $('save').onclick = async () => {
   if (!D.media.can_save){ toast('Saving is disabled (read-only mode).'); return; }
   const r = await fetch('api/save-offset', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mp3_offset_sec: offset})});
   const j = await r.json().catch(() => ({}));
+  if (r.ok && j.ok){ DEFAULT_OFFSET = j.mp3_offset_sec; }
   if (r.ok && j.ok) toast(`Saved mp3_offset_sec = ${j.mp3_offset_sec} s to ${j.config}. Re-run main.py for this session to re-score the steps and re-render the overlay.`, 8000);
   else toast('Save failed: ' + (j.error || r.status));
 };
@@ -1268,6 +1301,7 @@ function frame(now){
   if (now - lastDriftUi > 200){
     lastDriftUi = now; const d = $('drift');
     if (!audio) d.textContent = 'no song';
+    else if (SYNC.blocked && !video.paused) { d.textContent = 'audio blocked: click ▶'; d.classList.add('bad'); }
     else if (SYNC.drift == null) d.textContent = (targetTime() < 0 && !video.paused) ? 'music starts in ' + (-targetTime()).toFixed(1) + ' s' : 'sync idle';
     else { d.textContent = 'drift ' + sgn(SYNC.drift * 1000, 0) + ' ms'; d.classList.toggle('bad', Math.abs(SYNC.drift) > SYNC.tol); }
   }
@@ -1277,7 +1311,7 @@ function frame(now){
   requestAnimationFrame(frame);
 }
 if (!D.media.video){ $('play').disabled = true; toast('Video not available.'); }
-window.__dash = {get offset(){ return offset; }, sync: SYNC, video, audio, setOffset, videoClock, map: MAP, selectStep, get data(){ return D; }};
+window.__dash = {get defaultOffset(){ return DEFAULT_OFFSET; }, get offset(){ return offset; }, sync: SYNC, video, audio, setOffset, videoClock, map: MAP, selectStep, get data(){ return D; }};
 renderAll(); updatePlayBtn(); requestAnimationFrame(frame);
 })();
 </script>

@@ -1,10 +1,14 @@
-"""Beat grid of the clean song .mp3 and its alignment to the cam1 timeline.
+"""Beat grid of the clean song .mp3, placed on the cam1 timeline.
 
 ``mp3_offset_sec`` is the cam1 time (s) at which the song's t=0 occurs::
 
     cam1_time = mp3_time + mp3_offset_sec
 
-It is negative when the song was already playing before cam1 started recording.
+By default the song is assumed to start with the video: ``mp3_offset_sec = 0.0``
+(method "default"), unless ``overrides.mp3_offset_sec`` in sessions.json sets a value
+(method "manual"). Automatic cross-correlation against the noisy cam1 audio produced
+unreliable offsets (e.g. -130 s at confidence 0.09). It is disabled and only runs if
+``music.auto_align`` is explicitly set to true.
 """
 
 from __future__ import annotations
@@ -24,7 +28,8 @@ DEFAULT_MUSIC_PARAMS: dict[str, Any] = {
     "bandpass_hz": [60, 250],
     "sr": 22050,
     "hop_length": 512,
-    "max_offset_s": None,  # optionally limit |mp3_offset_sec| searched
+    "max_offset_s": None,  # optionally limit |mp3_offset_sec| searched (auto_align only)
+    "auto_align": False,  # opt-in xcorr alignment against cam1 audio (disabled by default: unreliable)
 }
 
 
@@ -44,7 +49,7 @@ class MusicAlignment:
     beat_period_sec: float
     mp3_offset_sec: float
     aligned_beat_times_sec: list[float]  # beat times on the cam1 timeline
-    method: str  # "manual" | "xcorr" | "unaligned"
+    method: str  # "default" (0.0) | "manual" (sessions.json override) | "xcorr" (opt-in) | "unaligned"
     confidence: float
     beat_times_mp3_sec: list[float] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -191,6 +196,10 @@ def align_music(
 
     if manual_offset_sec is not None:
         return build_alignment(song, float(manual_offset_sec), "manual", 1.0)
+
+    if not p.get("auto_align", False):
+        # Song starts with the video; beat grid anchored at 0.0 s.
+        return build_alignment(song, 0.0, "default", 1.0)
 
     if not cam1_video:
         msg = "No cam1 video given; mp3 offset assumed 0"

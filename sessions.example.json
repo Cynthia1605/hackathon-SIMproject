@@ -18,7 +18,8 @@
       ],
       "sr": 22050,
       "hop_length": 512,
-      "max_offset_s": null
+      "max_offset_s": null,
+      "auto_align": false
     },
     "segmenter": {
       "window_s": 1.5,

@@ -296,7 +296,14 @@ def test_align_music_end_to_end_and_manual_override(song_analysis, monkeypatch, 
     sf.write(song_path, y, SR)
     monkeypatch.setattr(sync, "load_video_audio", lambda path, sr=SR: rec)
 
-    res = MA.align_music(str(song_path), "cam1.mp4")
+    # default: no automatic alignment, the song starts with the video at 0.0 s
+    d = MA.align_music(str(song_path), "cam1.mp4", song=song)
+    assert d.method == "default" and d.mp3_offset_sec == 0.0 and not d.warnings
+    assert d.aligned_beat_times_sec == pytest.approx(d.beat_times_mp3_sec)
+    assert d.bpm == pytest.approx(120.0, rel=0.03)  # beat tracking still works
+
+    # opt-in cross-correlation (music.auto_align = true) still available
+    res = MA.align_music(str(song_path), "cam1.mp4", params={"auto_align": True})
     assert res.method == "xcorr"
     assert res.mp3_offset_sec == pytest.approx(2.5, abs=0.03)
     assert res.aligned_beat_times_sec[0] == pytest.approx(res.beat_times_mp3_sec[0] + res.mp3_offset_sec)
@@ -317,7 +324,11 @@ def test_align_music_handles_missing_video_audio(song_analysis, monkeypatch):
         raise RuntimeError("no audio stream")
 
     monkeypatch.setattr(sync, "load_video_audio", boom)
+    # default mode never touches the cam1 audio
     res = MA.align_music("unused.mp3", "cam1.mp4", song=song)
+    assert res.method == "default" and res.mp3_offset_sec == 0.0 and not res.warnings
+    # opt-in mode degrades gracefully
+    res = MA.align_music("unused.mp3", "cam1.mp4", params={"auto_align": True}, song=song)
     assert res.method == "unaligned" and res.mp3_offset_sec == 0.0 and res.warnings
 
 

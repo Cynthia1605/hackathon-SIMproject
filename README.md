@@ -39,7 +39,7 @@ Edit one entry per subject. Relative paths are resolved against the folder that 
 - `defaults` holds every tunable parameter, grouped by module (`sync`, `music`, `calibration`, `filters`, `segmenter`, `rhythm`).
 - `params` in a session overrides any of them for that subject only, deep-merged. For example: `{"rhythm": {"count_one_foot": "R"}}`.
 - `overrides.frame_offset`: force the camera sync if clap detection gets it wrong. Convention: `cam2_frame = cam1_frame + frame_offset`.
-- `overrides.mp3_offset_sec`: force the music alignment. Convention: `cam1_time = mp3_time + mp3_offset_sec`, negative if the song was already playing when cam1 started.
+- `overrides.mp3_offset_sec`: where the song starts on the cam1 timeline. Leave it `null` and the song is assumed to start with the video (`0.0 s`). Set a number only if the music started later (positive) or earlier (negative) than cam1. Convention: `cam1_time = mp3_time + mp3_offset_sec`. Automatic cross-correlation alignment is disabled because it was unreliable on noisy room audio; it can be re-enabled with `"music": {"auto_align": true}` in `defaults` or a session's `params`.
 
 ## 4. Run
 ```bash
@@ -65,13 +65,13 @@ The run ends with a comparison table:
 +-----------+--------+-------+------+--------+-------+------+--------------+---------+---------+
 ```
 (That example is the synthetic test run, where the second epoch is deliberately danced 60 ms late.)
-Any warnings follow the table: an audio/visual sync disagreement, low music-alignment confidence, few RANSAC inliers, or a tempo octave correction.
+Any warnings follow the table: an audio/visual sync disagreement, few RANSAC inliers, or a tempo octave correction.
 
 ## 5. Outputs (`outputs/<subject_id>/`)
 | File | Contents |
 |---|---|
 | `sync.json` | `frame_offset`, `method` (`manual` / `clap` / `clap+audio` / `motion_xcorr`), confidence, clap frames in each camera, audio cross-check |
-| `epochs_and_steps.json` | Everything: sync, music alignment (BPM, offset, beat grid), calibration (K, R, t, scale, reprojection error), segmentation thresholds, epochs with per-epoch summaries, every step, overall summary, warnings, the merged parameters used |
+| `epochs_and_steps.json` | Everything: sync, music (BPM, `mp3_offset_sec`, `method`: `default` = 0.0 s / `manual` = sessions.json, beat grid), calibration (K, R, t, scale, reprojection error), segmentation thresholds, epochs with per-epoch summaries, every step, overall summary, warnings, the merged parameters used |
 | `steps.csv` | One row per footfall: `subject_id, epoch_id, cam1_frame, timestamp_sec, nearest_music_beat_sec, beat_offset_ms, foot, timing_type, beat_count, step_length_cm` |
 | `rhythm_analysis.png` | Diagnostic plot (below) |
 | `overlay_cam1.mp4` | cam1 with skeleton + live rhythm HUD (see section 6) |
@@ -122,6 +122,7 @@ It opens `http://127.0.0.1:8765/`. Options: `--port`, `--no-browser`, and `--rea
   - Right (≈45%): the tempo score and verdict, KPI badges (BPM, On-tempo %, Mean offset, QQS accuracy), the **coaching diagnosis**, and a scrollable **rhythm error & step log**.
 - **Music sync.**
   - The song is served as a sample-accurate WAV, decoded once by ffmpeg to `outputs/<id>/song_sync.wav`. Browsers only seek `.mp3` approximately, which was the main source of drift.
+  - **Music offset.** The page starts at `overrides.mp3_offset_sec` from `sessions.json`, or `0.000 s` if it is not set, so the song plays from its start together with the video. It never uses an old offset stored in `epochs_and_steps.json`; steps are re-scored at the offset in use. Audio starts directly inside the ▶ click, which browsers require. If a browser still blocks it, the calibration bar shows "audio blocked: click ▶".
   - The page keeps `audio.currentTime = video.currentTime − mp3_offset_sec` on play, pause, seek and rate change, and in a `requestAnimationFrame` loop that uses a frame-accurate video clock:
     - drift above 40 ms is corrected with a gentle playback-rate trim;
     - drift above 150 ms gets a hard re-seek;
@@ -156,7 +157,7 @@ It opens `http://127.0.0.1:8765/`. Options: `--port`, `--no-browser`, and `--rea
 
 ## 7. Troubleshooting
 - **Sync `method` is `motion_xcorr`, or the offset looks wrong.** No clap was found in both cameras. Check `clap_frames_cam1/cam2` in `sync.json`, then set `overrides.frame_offset`. One way to find it: note the video frame of the clap in each camera, and use `cam2_frame - cam1_frame`.
-- **Music `confidence` < 0.2, or every step is off by the same amount.** The music alignment is likely one beat out. Set `overrides.mp3_offset_sec`.
+- **Every step is off by the same amount.** The song probably did not start exactly with the video. In the dashboard, turn on the metronome, use *Tap Beat 1 Now* or the ±50 ms nudges until the clicks match the music, then *Save Offset to sessions.json* and re-run `main.py` for that session.
 - **Too few or too many epochs.** Tune `segmenter.min_start_energy` / `min_stop_energy`, and see the energy curve in panel 1.
 - **Beats 1-2-3 and 5-6-7 swapped.** The count is anchored on the first foot of the first complete quick-quick-slow group. If needed, force the beat-1 foot with `rhythm.count_one_foot` (`"L"` or `"R"`).
 - **High reprojection error in `calibration`.** Usually a bad sync offset, or a camera that doesn't see the whole body.
@@ -167,7 +168,7 @@ It opens `http://127.0.0.1:8765/`. Options: `--port`, `--no-browser`, and `--rea
 | `landmarks.py` | MediaPipe 33-landmark index constants |
 | `pose_2d.py` | PoseLandmarker (heavy, VIDEO mode) to `(N,33,3)` `[x_px, y_px, vis]`, cached `.npz` |
 | `sync.py` | Visual clap detector, >2.5 kHz audio cross-check, hip/ankle motion fallback, manual override |
-| `music_analyzer.py` | librosa HPSS beat grid; mp3 to cam1 alignment via a 60–250 Hz onset envelope cross-correlation |
+| `music_analyzer.py` | librosa HPSS beat grid and BPM, anchored at `mp3_offset_sec` (0.0 s unless overridden); optional opt-in onset cross-correlation (`auto_align`) |
 | `calibrate_3d.py` | Approximate K. RANSAC F re-fitted on its inliers, E = KᵀFK, recoverPose. Triangulation, eye-to-heel height scaling, SVD floor fit to Y = 0 (+Y up) |
 | `filters.py` | Vectorised 3D One Euro filter. NaN-gap safe; zero-lag forward/backward mode for offline use |
 | `epoch_segmenter.py` | Foot-only motion energy, adaptive hysteresis, gap merging and short-burst removal. Epochs are trimmed to actual foot motion |
@@ -184,7 +185,7 @@ Each stage also has its own CLI for debugging (`pose_2d.py`, `sync.py`, `music_a
 ```bash
 pytest -q
 ```
-106 synthetic tests (`tests/test_pipeline.py`, `tests/test_overlay_dashboard.py`); no video, audio or model files are needed. They include an end-to-end run of `main.py` on two simulated subjects:
+108 synthetic tests (`tests/test_pipeline.py`, `tests/test_overlay_dashboard.py`); no video, audio or model files are needed. They include an end-to-end run of `main.py` on two simulated subjects:
 - a timeline of 10 s idle with a clap, 16 s of 180 BPM basic steps, 8 s idle, and 16 s more stepping;
 - each subject projected into two virtual cameras;
 - checks: sync, epoch boundaries, zero idle/clap false steps, 100% QUICK/SLOW and beat-count accuracy, beat offsets including a deliberate 60 ms late drift, and all exported files.

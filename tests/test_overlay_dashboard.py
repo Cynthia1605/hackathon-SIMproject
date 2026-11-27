@@ -28,7 +28,7 @@ PATTERN = [(1, "L", "QUICK"), (2, "R", "QUICK"), (3, "L", "SLOW"), (5, "R", "QUI
 # --------------------------------------------------------------------------- #
 # Synthetic report (same schema as epochs_and_steps.json)
 # --------------------------------------------------------------------------- #
-def make_report(offsets_fn=lambda i, beat, foot: 0.0, epochs=((2.0, 10.0),), mp3_offset=0.5, phase_beats=0,
+def make_report(offsets_fn=lambda i, beat, foot: 0.0, epochs=((2.0, 10.0),), mp3_offset=0.0, phase_beats=0,
                 qqs=1.0):
     """Steps on a 180 BPM grid inside each epoch; offsets_fn(i, beat, foot) gives ms."""
     grid = mp3_offset + np.arange(0, 80) * PERIOD
@@ -158,7 +158,7 @@ def test_octave_corrected_grid_used_for_counts_and_rescoring():
     tl = OV.RhythmTimeline.from_report(rep)
     for s in rep["steps"]:
         assert tl.beat_count_at(s["nearest_music_beat_sec"] + 0.01) == s["beat_count"]
-    d = DB.build_dashboard_data(rep, mp3_offset=0.5 + 0.01)
+    d = DB.build_dashboard_data(rep, mp3_offset=0.01)  # music 10 ms later than the scored 0.0 s
     offs = [s["offset_ms"] for s in d["steps"]]
     assert max(abs(o) for o in offs) <= PERIOD * 500 + 1  # never more than half a (real) beat
     assert all(abs(o - 10.0) < 1 for o in offs)
@@ -398,15 +398,37 @@ def test_offbeat_grid_warning_and_wrapped_offsets():
 def test_shift_report_rescoring():
     rep = make_report(lambda i, b, f: 60.0)  # dancer consistently 60 ms late
     d0 = DB.build_dashboard_data(rep)
+    assert d0["mp3_offset_sec"] == 0.0 and d0["mp3_offset_default_sec"] == 0.0
     assert d0["kpis"]["on_tempo_pct"] == 0
-    d1 = DB.build_dashboard_data(rep, mp3_offset=0.5 + 0.06)  # move the music 60 ms later
-    assert d1["mp3_offset_sec"] == pytest.approx(0.56) and d1["mp3_offset_analyzed_sec"] == pytest.approx(0.5)
+    d1 = DB.build_dashboard_data(rep, mp3_offset=0.06)  # move the music 60 ms later
+    assert d1["mp3_offset_sec"] == pytest.approx(0.06) and d1["mp3_offset_default_sec"] == 0.0
     assert d1["kpis"]["on_tempo_pct"] == 100 and abs(d1["kpis"]["mean_offset_ms"]) < 1
-    assert d1["beats"][0]["t"] == pytest.approx(0.56)
-    assert rep["music"]["mp3_offset_sec"] == 0.5  # original untouched
+    assert d1["beats"][0]["t"] == pytest.approx(0.06)
+    assert rep["music"]["mp3_offset_sec"] == 0.0  # original untouched
     # a shift of more than half a beat wraps to the nearest beat
-    d2 = DB.build_dashboard_data(rep, mp3_offset=0.5 + PERIOD)
+    d2 = DB.build_dashboard_data(rep, mp3_offset=PERIOD)
     assert abs(d2["kpis"]["mean_offset_ms"] - 60) < 1
+
+
+def test_default_offset_is_zero_not_the_stale_report_value():
+    """An old report with a bogus auto-aligned offset (-130.757 s) must play from 0.0 s."""
+    good = make_report(lambda i, b, f: 10.0)  # scored with the song starting at 0.0 s
+    stale = DB.shift_report(good, -130.757)  # what an old xcorr run left in epochs_and_steps.json
+    assert stale["music"]["mp3_offset_sec"] == pytest.approx(-130.757)
+    d = DB.build_dashboard_data(stale)
+    assert d["mp3_offset_sec"] == 0.0 and d["mp3_offset_default_sec"] == 0.0
+    assert d["beats"][0]["t"] == pytest.approx(0.0)
+    assert d["kpis"]["on_tempo_pct"] == 100 and d["kpis"]["mean_offset_ms"] == pytest.approx(10, abs=0.5)
+    # an explicit sessions.json override is used as the default instead
+    d2 = DB.build_dashboard_data(good, default_offset=0.01)
+    assert d2["mp3_offset_sec"] == pytest.approx(0.01) and d2["mp3_offset_default_sec"] == pytest.approx(0.01)
+    assert d2["kpis"]["mean_offset_ms"] == pytest.approx(0, abs=0.5)
+
+
+def test_page_has_no_alignment_status_label():
+    html = DB.INDEX_HTML
+    assert "music alignment" not in html and "analysed offset" not in html and "ANALYZED" not in html
+    assert "primeAudio" in html and "audio blocked" in html  # audio starts inside the user's click
 
 
 def test_dashboard_without_steps():
@@ -445,7 +467,7 @@ def server(tmp_path):
     cfg_path = tmp_path / "sessions.json"
     cfg_path.write_text(json.dumps(cfg))
     media = {"video": True, "video_is_overlay": True, "audio": True, "audio_format": "wav"}
-    srv = DB.make_server(make_report(), media, video, audio, "127.0.0.1", 0,
+    srv = DB.make_server(DB.shift_report(make_report(), -130.757), media, video, audio, "127.0.0.1", 0,
                          save_cb=lambda v: DB.save_offset_to_config(cfg_path, "s1", v))
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
@@ -467,6 +489,7 @@ def test_server_serves_page_and_data(server):
     st, _, body = _req(base + "/api/data")
     d = json.loads(body)
     assert d["subject_id"] == "synthetic" and d["steps"] and d["media"]["can_save"] is True
+    assert d["mp3_offset_sec"] == 0.0  # stale -130.757 s report offset ignored: song plays from 0.0 s
     st, _, body = _req(base + "/api/data?mp3_offset=0.6")
     assert json.loads(body)["mp3_offset_sec"] == pytest.approx(0.6)
     with pytest.raises(urllib.error.HTTPError) as e:
@@ -507,7 +530,9 @@ def test_save_offset_endpoint_persists(server):
     assert s1["overrides"] == {"frame_offset": 3, "mp3_offset_sec": 1.2346}  # other overrides kept
     assert s1["params"] == {"x": 1} and "overrides" not in s2  # rest of the file untouched
     _, _, body = _req(base + "/api/data")
-    assert json.loads(body)["media"]["saved_offset"] == pytest.approx(1.2346)
+    d = json.loads(body)
+    assert d["media"]["saved_offset"] == pytest.approx(1.2346)
+    assert d["mp3_offset_sec"] == pytest.approx(1.2346) and d["mp3_offset_default_sec"] == pytest.approx(1.2346)
 
 
 @pytest.mark.parametrize("data,headers,code", [
@@ -571,6 +596,11 @@ def test_load_subject_prepares_wav_and_falls_back_to_original_video(tmp_path):
     assert sid == "s1" and video == tmp_path / "data" / "cam1.mp4" and not media["video_is_overlay"]
     assert any("overlay_video.py" in n for n in notes)
     assert floor["available"] is False and any("Footwork map unavailable" in n for n in notes)  # no points3d.npz
+    assert media["default_offset"] == 0.0 and media["offset_source"] == "default"
+    cfg["sessions"][0]["overrides"] = {"mp3_offset_sec": 0.42}
+    (tmp_path / "sessions.json").write_text(json.dumps(cfg))
+    _, media2, *_ = DB.load_subject(str(tmp_path / "sessions.json"), "s1", prepare_audio=False)
+    assert media2["default_offset"] == 0.42 and media2["offset_source"] == "sessions.json"
     if ffmpeg:
         assert audio == out / "song_sync.wav" and audio.read_bytes()[:4] == b"RIFF" and media["audio_format"] == "wav"
     with pytest.raises(SystemExit):

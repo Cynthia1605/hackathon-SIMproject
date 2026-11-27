@@ -229,8 +229,7 @@ def run_session(sess: dict[str, Any], cfg: dict[str, Any], force_pose: bool = Fa
     log.info("[%s] music", sid)
     music = music_analyzer.align_music(sess["song_mp3"], sess["cam1"], sess["overrides"]["mp3_offset_sec"],
                                        params["music"])
-    log.info("[%s] music: %.1f BPM, mp3 offset %.3fs via %s (conf %.2f)", sid, music.bpm, music.mp3_offset_sec,
-             music.method, music.confidence)
+    log.info("[%s] music: %.1f BPM, mp3 offset %.3fs (%s)", sid, music.bpm, music.mp3_offset_sec, music.method)
     row = analyze_subject(sid, pose1, pose2, music, sess["height_meters"], params, out_dir, sess["cam1"],
                           sess["cam2"], sess["overrides"]["frame_offset"])
     row["overlay"] = None
